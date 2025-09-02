@@ -27,22 +27,22 @@ const CONFESSIONS_CHANNEL_ID = '1407177292605685932';
 const BREAKING_CHANNEL_ID    = '1407176815285637313';
 
 // 🔒 Spotlight submissions go here (make a private channel and paste its ID)
-const SPOTLIGHT_CHANNEL_ID   = '1411392998427856907';
+const SPOTLIGHT_CHANNEL_ID = '1411392998427856907';
 
-// ---- Folders (Windows paths) ----
-const API_PORT = 3030;
+// ---- Folders (portable via .env; Windows defaults only on your PC) ----
+const API_PORT = process.env.PORT ? Number(process.env.PORT) : 3030;
 
 // Base data folder used by all JSON/state
-const DATA_DIR = 'D:\\Soapbox App\\data';
+const DATA_DIR = process.env.DATA_DIR || 'D:\\Soapbox App\\data';
 
 // Spotlight feed (folders you create for each video)
-const SPOTLIGHT_FEED_DIR = 'D:\\Soapbox App\\Spotlights';
+const SPOTLIGHT_FEED_DIR = process.env.SPOTLIGHT_FEED_DIR || 'D:\\Soapbox App\\Spotlights';
 
 // Stories root (Story1/Story2/... with metadata/voicemail/witnesses)
-const STORIES_ROOT = 'D:\\Soapbox App\\Stories';
+const STORIES_ROOT = process.env.STORIES_ROOT || 'D:\\Soapbox App\\Stories';
 
-// Old voicemail drop folder the watcher still supports
-const WATCH_DIR = 'D:\\Soapbox App\\Voicemails for Discord';
+// Old voicemail drop folder the watcher still supports (empty by default on servers)
+const WATCH_DIR = process.env.WATCH_DIR || '';  // <<< IMPORTANT: no Windows fallback here
 
 // JSON files the server writes/reads
 const CONF_JSON      = path.join(DATA_DIR, 'confessions.json');
@@ -70,7 +70,7 @@ function tsBase(d = new Date()){
 }
 function stamp(){
   const d = new Date();
-  return `${d.getFullYear()}${pad(d.getMonth()+1)}${pad(d.getDate())}_${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}`;
+  return `${d.getFullYear()}${pad(d.getMonth()+1)}${pad(d.getDate())}_${d.getHours().toString().padStart(2,'0')}${d.getMinutes().toString().padStart(2,'0')}${d.getSeconds().toString().padStart(2,'0')}`;
 }
 
 async function waitForSettle(fp){
@@ -103,7 +103,7 @@ async function renameSafe(oldFull){
 async function postVoicemail(filePath){
   const ch = await client.channels.fetch(VOICEMAIL_CHANNEL_ID);
   const att = new AttachmentBuilder(filePath);
-  await ch.send({ content: `📢 **New Hotline Voicemail (323-743-3744)**`, files: [att] });
+  await ch.send({ content: `📢 **New Hotline Voicemail (323-743-3744)**`, files: [att] }); 
   console.log('✅ Posted voicemail:', path.basename(filePath));
 }
 
@@ -113,6 +113,12 @@ function ensureData(){
   if (!fs.existsSync(STORIES_ROOT)) fs.mkdirSync(STORIES_ROOT, { recursive: true });
   if (!fs.existsSync(SPOTLIGHT_JSON)) fs.writeFileSync(SPOTLIGHT_JSON, '[]');
   if (!fs.existsSync(SPOTLIGHT_FEED_DIR)) fs.mkdirSync(SPOTLIGHT_FEED_DIR, { recursive: true });
+
+  // NEW: if you configured WATCH_DIR, make sure it exists so we can actually watch it
+  if (WATCH_DIR) {
+    try { fs.mkdirSync(WATCH_DIR, { recursive: true }); } 
+    catch (e) { console.warn('Could not create WATCH_DIR:', WATCH_DIR, e?.message || e); }
+  }
 }
 
 function readJSONSafe(fp, fallback){
@@ -335,6 +341,9 @@ function startApi(){
   app.use(cors());
   app.use(express.json({ limit: '64kb' }));
 
+  // --- PUBLIC health check (added) ---
+  app.get('/health', (_req, res) => res.json({ ok: true })); // <<< added
+
   // Static for Spotlight thumbnails (single mount, correct path)
   app.use('/spotlight-static', express.static(SPOTLIGHT_FEED_DIR, { fallthrough: true }));
 
@@ -410,12 +419,42 @@ function startApi(){
     }
   });
 
-  // ---- AUTH GATE for the rest (allow CORS preflight) ----
-  app.use((req,res,next)=>{
+  // ---- AUTH GATE with allowlist (replaces blanket 401) ----
+  const PUBLIC_PREFIXES = ['/static', '/spotlight-static'];
+  const PUBLIC_ROUTES = new Set([
+    '/health',
+    '/voicemail',
+    '/spotlight-videos',
+    '/spotlight-feed',
+    '/confessions',   // GET public
+    '/stories',       // GET public
+    '/geo'
+  ]);
+
+  app.use((req, res, next) => {
     if (req.method === 'OPTIONS') return next();
+
+    // allow static mounts
+    if (PUBLIC_PREFIXES.some(p => req.path.startsWith(p))) return next();
+
+    // allow listed GET endpoints
+    for (const base of PUBLIC_ROUTES) {
+      if (req.path === base || req.path.startsWith(base + '/')) {
+        if (req.method === 'GET') return next();
+        break;
+      }
+    }
+
+    // explicitly allow POST /confessions (rate-limited in handler)
+    if (req.method === 'POST' && (req.path === '/confessions' || req.path.startsWith('/confessions/'))) {
+      return next();
+    }
+
+    // everything else requires key
     if (!authOk(req)) return res.status(401).json({ error: 'Unauthorized' });
     next();
   });
+  // ---- end allowlist gate ----
 
   // --- Spotlight feed (scan D:\Soapbox App\Spotlights\* subfolders)
   app.get('/spotlight-videos', (req, res) => {
@@ -865,11 +904,11 @@ function startApi(){
   });
 
   // ---- listen ----
-  app.listen(API_PORT, () => {
+  app.listen(API_PORT, '0.0.0.0', () => { // <<< bound to all interfaces
     const ip = getLocalIp();
     console.log(`📡 API listening on http://${ip}:${API_PORT}`);
-    console.log('   PUBLIC:  GET /voicemail/:story, GET /stories/:id/voicemail, GET /static/... (thumbnails/videos), GET /geo');
-    console.log('   SECURE:  GET /stories, GET/POST /confessions, POST /witness, POST /admin/sync-stories, POST /admin/rotate-stories, POST /admin/rotate-story/:id  (x-soapbox-key required)');
+    console.log('   PUBLIC:  GET /health, GET /voicemail/:story, GET /stories/:id/voicemail, GET /static/... (thumbnails/videos), GET /spotlight-videos, GET /spotlight-feed, GET /confessions, GET /stories, GET /geo');
+    console.log('   SECURE:  POST /confessions (allowed public in gate above), POST /witness, POST /admin/sync-stories, POST /admin/rotate-stories, POST /admin/rotate-story/:id  (x-soapbox-key required)');
   });
 } // end startApi()
 
@@ -877,27 +916,51 @@ function startApi(){
 const processing = new Set();
 function startWatcher(){
   ensureData();
+
+  // If unset, skip entirely (good for Render when you don’t want the watcher)
+  if (!WATCH_DIR) {
+    console.warn('⚠️ WATCH_DIR not found (unset). Skipping drop-folder watcher.');
+    return;
+  }
+
+  // Ensure the folder exists if configured (prevents ENOENT)
+  try { fs.mkdirSync(WATCH_DIR, { recursive: true }); } catch {}
+
+  if (!fs.existsSync(WATCH_DIR)) {
+    console.warn(`⚠️ WATCH_DIR not found (${WATCH_DIR}). Skipping drop-folder watcher.`);
+    return;
+  }
+
   console.log(`👀 Watching: ${WATCH_DIR}`);
-  fs.watch(WATCH_DIR, { persistent:true }, async(_e, file)=>{
-    if (!file) return;
-    const full = path.join(WATCH_DIR, file);
-    try { await fsp.access(full); } catch { return; }
-    if (!isAudio(full)) return;
-    if (processing.has(full)) return;
-    processing.add(full);
-    try{
-      if (SAFE_NAME_RE.test(path.basename(full))) { processing.delete(full); return; }
-      console.log('📥 New audio:', full);
-      await waitForSettle(full);
-      const safe = await renameSafe(full);
-      await postVoicemail(safe);
-    }catch(e){
-      console.error('watcher error:', e);
-    }finally{
-      processing.delete(full);
-    }
-  });
+
+  // Wrap fs.watch so errors don’t crash the process
+  try {
+    fs.watch(WATCH_DIR, { persistent: true }, async (_e, file) => {
+      if (!file) return;
+      const full = path.join(WATCH_DIR, file);
+      try { await fsp.access(full); } catch { return; }
+      if (!isAudio(full)) return;
+      if (processing.has(full)) return;
+      processing.add(full);
+      try{
+        if (SAFE_NAME_RE.test(path.basename(full))) { processing.delete(full); return; }
+        console.log('📥 New audio:', full);
+        await waitForSettle(full);
+        const safe = await renameSafe(full);
+        await postVoicemail(safe);
+      }catch(e){
+        console.error('watcher error:', e);
+      }finally{
+        processing.delete(full);
+      }
+    }).on('error', (err) => {
+      console.error('Watcher failed:', err);
+    });
+  } catch (err) {
+    console.error('Failed to start watcher:', err);
+  }
 }
+
 
 // ===================== boot =====================
 client.once('ready', ()=>{
