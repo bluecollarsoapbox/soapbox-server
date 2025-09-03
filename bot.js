@@ -61,6 +61,13 @@ const SETTLE_ROUNDS = 3;
 // ---- Discord client ----
 const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages] });
 
+console.log('[PATHS]',
+  'DATA_DIR=', DATA_DIR,
+  'STORIES_ROOT=', STORIES_ROOT,
+  'SPOTLIGHT_FEED_DIR=', SPOTLIGHT_FEED_DIR
+);
+
+
 // ===================== helpers =====================
 const pad = (n) => String(n).padStart(2, '0');
 const isAudio = (p) => AUDIO_EXTS.has(path.extname(p).toLowerCase());
