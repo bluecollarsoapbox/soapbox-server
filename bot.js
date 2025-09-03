@@ -179,6 +179,29 @@ function firstVoicemailFile(storyId){
     .sort((a,b)=> fs.statSync(b).mtimeMs - fs.statSync(a).mtimeMs);
   return files[0] || null;
 }
+// --- witness index helpers (store alongside each StoryN folder) ---
+function readJsonSafe(p, fallback) {
+  try { return JSON.parse(fs.readFileSync(p, 'utf8')); } catch { return fallback; }
+}
+function writeJsonSafe(p, obj) {
+  fs.writeFileSync(p, JSON.stringify(obj, null, 2));
+}
+function storyDir(storyId) {
+  return path.join(STORIES_ROOT, storyId); // STORIES_ROOT already defined in your file
+}
+function witnessIndexPath(storyId) {
+  return path.join(storyDir(storyId), 'witnesses.json');
+}
+function loadWitnesses(storyId) {
+  return readJsonSafe(witnessIndexPath(storyId), []); // [{id, uri, ts, likes, likedBy:[]}]
+}
+function saveWitnesses(storyId, list) {
+  writeJsonSafe(witnessIndexPath(storyId), list);
+}
+function newId() {
+  return Math.random().toString(36).slice(2) + Date.now().toString(36);
+}
+
 
 // --- Story sync log (prevents reposting the same cycle) ---
 function readStorySync(){ try { return JSON.parse(fs.readFileSync(STORY_SYNC,'utf8')); } catch { return {}; } }
@@ -870,14 +893,12 @@ async function safeMove(src, dest) {
   });
 
 // --- Witness upload -> save in StoryN\witnesses and post to Discord thread/channel (async) ---
-const uploadTmp = os.tmpdir(); // OS tmp dir (avoids EXDEV cross-device errors)
+const uploadTmp = path.join(DATA_DIR, 'tmp');
 ensureDir(uploadTmp);
 const upload = multer({ dest: uploadTmp });
 
 app.post('/witness', upload.any(), async (req, res) => {
-  // never time out this request on slow networks
   req.setTimeout(0);
-
   try {
     const storyId = (req.body?.storyId || '').toString().trim();
     const note    = (req.body?.note || '').toString().trim();
@@ -893,13 +914,13 @@ app.post('/witness', upload.any(), async (req, res) => {
     const safeName = `${stamp()}_witness${ext}`;
     const destPath = path.join(destDir, safeName);
 
-    // Move file safely (fall back to copy/unlink on EXDEV)
+    // cross-device safe move
     try {
-      await safeMove(file.path, destPath);
+      fs.renameSync(file.path, destPath);
     } catch (e) {
       if (e && e.code === 'EXDEV') {
         fs.copyFileSync(file.path, destPath);
-        try { fs.unlinkSync(file.path); } catch {}
+        fs.unlinkSync(file.path);
       } else {
         throw e;
       }
@@ -907,14 +928,22 @@ app.post('/witness', upload.any(), async (req, res) => {
 
     // public URL returned to the app immediately
     const publicUrl = `/static/${storyId}/witnesses/${path.basename(destPath)}`;
-    res.json({ ok: true, uri: publicUrl });
 
-    // 🔹 Post to Discord in the background
+    // add this witness to the story index (for the in-app feed)
+    const wid = newId();
+    const entry = { id: wid, uri: publicUrl, ts: Date.now(), likes: 0, likedBy: [] };
+    const list = loadWitnesses(storyId);
+    list.unshift(entry);
+    saveWitnesses(storyId, list);
+
+    res.json({ ok: true, uri: publicUrl, id: wid });
+
+    // post to Discord (thread if available, else channel)
     process.nextTick(async () => {
       try {
+        const syncPath = path.join(DATA_DIR, 'stories-sync.json');
         let threadId = null;
         try {
-          const syncPath = path.join(DATA_DIR, 'stories-sync.json');
           const sync = JSON.parse(fs.readFileSync(syncPath, 'utf8'));
           const ref = sync?.[storyId]?.ref;
           if (ref && ref.type === 'thread' && ref.id) threadId = ref.id;
@@ -926,19 +955,63 @@ app.post('/witness', upload.any(), async (req, res) => {
           files: [{ attachment: destPath, name: path.basename(destPath) }],
           allowedMentions: { parse: [] }
         };
-
         await target.send(payload);
         console.log(`📤 Witness posted for ${storyId} → ${threadId ? 'thread' : '#breaking-news'}`);
-      } catch (err) {
-        console.error('Discord post failed (witness):', err);
+      } catch (e) {
+        console.error('Discord post failed (witness):', e);
       }
     });
 
-  } catch (err) {
-    console.error('witness upload failed:', err);
+  } catch (e) {
+    console.error('witness upload failed:', e);
     return res.status(500).json({ error: 'Upload failed' });
   }
 });
+
+// Get witnesses for a story (public)
+app.get('/stories/:id/witnesses', (req, res) => {
+  try {
+    const storyId = String(req.params.id || '').trim();
+    if (!storyId) return res.status(400).json({ error: 'Missing story id' });
+    const list = loadWitnesses(storyId);
+    res.json(Array.isArray(list) ? list : []);
+  } catch {
+    res.json([]);
+  }
+});
+
+// Like / Unlike a witness (needs deviceId; idempotent toggle)
+app.post('/witness/like', express.json(), (req, res) => {
+  try {
+    const storyId  = String(req.body?.storyId || '').trim();
+    const witnessId = String(req.body?.witnessId || '').trim();
+    const deviceId = String(req.body?.deviceId || '').trim();
+
+    if (!storyId || !witnessId || !deviceId) {
+      return res.status(400).json({ error: 'Missing storyId, witnessId, or deviceId' });
+    }
+    const list = loadWitnesses(storyId);
+    const i = list.findIndex(x => x.id === witnessId);
+    if (i < 0) return res.status(404).json({ error: 'Not found' });
+
+    const likedBy = new Set(list[i].likedBy || []);
+    if (likedBy.has(deviceId)) {
+      likedBy.delete(deviceId);
+    } else {
+      likedBy.add(deviceId);
+    }
+    list[i].likedBy = Array.from(likedBy);
+    list[i].likes = list[i].likedBy.length;
+    saveWitnesses(storyId, list);
+
+    res.json({ ok: true, likes: list[i].likes, liked: likedBy.has(deviceId) });
+  } catch (e) {
+    console.error('like err', e);
+    res.status(500).json({ error: 'Failed' });
+  }
+});
+
+
 
   // ---- listen ----
   app.listen(API_PORT, '0.0.0.0', () => { // <<< bound to all interfaces
