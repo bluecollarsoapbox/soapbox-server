@@ -842,66 +842,76 @@ function startApi(){
     }
   });
 
-  // --- Witness upload -> save in StoryN\witnesses and post to Discord thread/channel (async) ---
-  const uploadTmp = path.join(DATA_DIR, 'tmp');
-  ensureDir(uploadTmp);
-  const upload = multer({ dest: uploadTmp });
+// --- Witness upload -> save in StoryN\witnesses and post to Discord thread/channel (async) ---
+const uploadTmp = os.tmpdir(); // OS tmp dir (avoids EXDEV cross-device errors)
+ensureDir(uploadTmp);
+const upload = multer({ dest: uploadTmp });
 
-  app.post('/witness', upload.any(), async (req, res) => {
-    // never time out this request on slow networks
-    req.setTimeout(0);
+app.post('/witness', upload.any(), async (req, res) => {
+  // never time out this request on slow networks
+  req.setTimeout(0);
 
+  try {
+    const storyId = (req.body?.storyId || '').toString().trim();
+    const note    = (req.body?.note || '').toString().trim();
+    if (!storyId) return res.status(400).json({ error: 'Missing storyId' });
+
+    const file = (req.files || []).find(f => f.fieldname === 'video' || f.fieldname === 'file');
+    if (!file) return res.status(400).json({ error: 'No file' });
+
+    const destDir = witnessFolder(storyId);
+    ensureDir(destDir);
+
+    const ext = (path.extname(file.originalname || '') || '.mp4').toLowerCase();
+    const safeName = `${stamp()}_witness${ext}`;
+    const destPath = path.join(destDir, safeName);
+
+    // Move file safely (fall back to copy/unlink on EXDEV)
     try {
-      const storyId = (req.body?.storyId || '').toString().trim();
-      const note    = (req.body?.note || '').toString().trim();
-      if (!storyId) return res.status(400).json({ error: 'Missing storyId' });
-
-      const file = (req.files || []).find(f => f.fieldname === 'video' || f.fieldname === 'file');
-      if (!file) return res.status(400).json({ error: 'No file' });
-
-      const destDir = witnessFolder(storyId);
-      ensureDir(destDir);
-
-      const ext = path.extname(file.originalname || '').toLowerCase() || '.mp4';
-      const safeName = `${stamp()}_witness${ext}`;
-      const destPath = path.join(destDir, safeName);
       fs.renameSync(file.path, destPath);
-
-      // public URL returned to the app immediately
-      const publicUrl = `/static/${storyId}/witnesses/${path.basename(destPath)}`;
-      res.json({ ok: true, uri: publicUrl });
-
-      // 🔹 Post to Discord in the background so client doesn't wait
-      process.nextTick(async () => {
-        try {
-          // try to target the per-story thread if it exists
-          const syncPath = path.join(DATA_DIR, 'stories-sync.json');
-          let threadId = null;
-          try {
-            const sync = JSON.parse(fs.readFileSync(syncPath, 'utf8'));
-            const ref = sync?.[storyId]?.ref;
-            if (ref && ref.type === 'thread' && ref.id) threadId = ref.id;
-          } catch {}
-
-          const target = await client.channels.fetch(threadId || BREAKING_CHANNEL_ID);
-          const payload = {
-            content: `🧾 **Witness Video**\nStory: ${storyId}${note ? `\nNote: ${note}` : ''}`,
-            files: [{ attachment: destPath, name: path.basename(destPath) }],
-            allowedMentions: { parse: [] }
-          };
-
-          await target.send(payload);
-          console.log(`📤 Witness posted for ${storyId} → ${threadId ? 'thread' : '#breaking-news'}`);
-        } catch (e) {
-          console.error('Discord post failed (witness):', e);
-        }
-      });
-
     } catch (e) {
-      console.error('witness upload failed:', e);
-      return res.status(500).json({ error: 'Upload failed' });
+      if (e && e.code === 'EXDEV') {
+        fs.copyFileSync(file.path, destPath);
+        try { fs.unlinkSync(file.path); } catch {}
+      } else {
+        throw e;
+      }
     }
-  });
+
+    // public URL returned to the app immediately
+    const publicUrl = `/static/${storyId}/witnesses/${path.basename(destPath)}`;
+    res.json({ ok: true, uri: publicUrl });
+
+    // 🔹 Post to Discord in the background
+    process.nextTick(async () => {
+      try {
+        let threadId = null;
+        try {
+          const syncPath = path.join(DATA_DIR, 'stories-sync.json');
+          const sync = JSON.parse(fs.readFileSync(syncPath, 'utf8'));
+          const ref = sync?.[storyId]?.ref;
+          if (ref && ref.type === 'thread' && ref.id) threadId = ref.id;
+        } catch {}
+
+        const target = await client.channels.fetch(threadId || BREAKING_CHANNEL_ID);
+        const payload = {
+          content: `🧾 **Witness Video**\nStory: ${storyId}${note ? `\nNote: ${note}` : ''}`,
+          files: [{ attachment: destPath, name: path.basename(destPath) }],
+          allowedMentions: { parse: [] }
+        };
+
+        await target.send(payload);
+        console.log(`📤 Witness posted for ${storyId} → ${threadId ? 'thread' : '#breaking-news'}`);
+      } catch (err) {
+        console.error('Discord post failed (witness):', err);
+      }
+    });
+
+  } catch (err) {
+    console.error('witness upload failed:', err);
+    return res.status(500).json({ error: 'Upload failed' });
+  }
+});
 
   // ---- listen ----
   app.listen(API_PORT, '0.0.0.0', () => { // <<< bound to all interfaces
