@@ -756,6 +756,26 @@ function startApi(){
       res.json([]);
     }
   });
+async function safeMove(src, dest) {
+  try {
+    fs.renameSync(src, dest);
+  } catch (err) {
+    if (err && err.code === 'EXDEV') {
+      // Cross-device: copy then unlink
+      await new Promise((resolve, reject) => {
+        const rd = fs.createReadStream(src);
+        const wr = fs.createWriteStream(dest);
+        rd.on('error', reject);
+        wr.on('error', reject);
+        wr.on('close', resolve);
+        rd.pipe(wr);
+      });
+      try { fs.unlinkSync(src); } catch {}
+    } else {
+      throw err;
+    }
+  }
+}
 
   // --- Stories list (metadata.json only) ---
   // Returns: [{ id, title, subtitle, thumbUrl, witnessCount, updatedAt }]
@@ -868,7 +888,7 @@ app.post('/witness', upload.any(), async (req, res) => {
 
     // Move file safely (fall back to copy/unlink on EXDEV)
     try {
-      fs.renameSync(file.path, destPath);
+      await safeMove(file.path, destPath);
     } catch (e) {
       if (e && e.code === 'EXDEV') {
         fs.copyFileSync(file.path, destPath);
