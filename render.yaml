@@ -1,43 +1,34 @@
+# render.yaml — 2 services only: API (web) + Bot (worker)
 services:
-  # --- WEB: Express API ---
   - type: web
     name: soapbox-api
     env: node
     plan: starter
-    branch: main
-    buildCommand: npm install
-    startCommand: node server.js
+    rootDir: soapbox-server
+    buildCommand: npm ci
+    startCommand: node server.js        # <- your Express entry
+    autoDeploy: true
     healthCheckPath: /health
     envVars:
       - fromGroup: soapbox-shared
-      - key: NODE_ENV
-        value: production
+    disk:
+      name: soapbox-data
+      mountPath: /data
 
-  # --- WORKER: Discord Bot ---
   - type: worker
     name: soapbox-bot
     env: node
     plan: starter
-    branch: main
-    buildCommand: npm install
-    startCommand: node bot.js
+    rootDir: soapbox-server
+    buildCommand: npm ci
+    startCommand: node bot.js           # <- your Discord bot entry
+    autoDeploy: true
     envVars:
       - fromGroup: soapbox-shared
-      - key: NODE_ENV
-        value: production
-    # Only add this disk if your bot needs persistent storage
     disk:
-      name: data
+      name: soapbox-data
       mountPath: /data
-      sizeGB: 5
 
-# Shared secrets for both services
-envVarGroups:
-  - name: soapbox-shared
-    envVars:
-      - key: DISCORD_TOKEN
-        sync: false
-      - key: SOAPBOX_API_KEY
-        sync: false
-      - key: DATA_DIR
-        value: /data
+disks:
+  - name: soapbox-data
+    sizeGB: 1
