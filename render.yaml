@@ -1,0 +1,43 @@
+services:
+  # --- WEB: Express API ---
+  - type: web
+    name: soapbox-api
+    env: node
+    plan: starter
+    branch: main
+    buildCommand: npm install
+    startCommand: node server.js
+    healthCheckPath: /health
+    envVars:
+      - fromGroup: soapbox-shared
+      - key: NODE_ENV
+        value: production
+
+  # --- WORKER: Discord Bot ---
+  - type: worker
+    name: soapbox-bot
+    env: node
+    plan: starter
+    branch: main
+    buildCommand: npm install
+    startCommand: node bot.js
+    envVars:
+      - fromGroup: soapbox-shared
+      - key: NODE_ENV
+        value: production
+    # Only add this disk if your bot needs persistent storage
+    disk:
+      name: data
+      mountPath: /data
+      sizeGB: 5
+
+# Shared secrets for both services
+envVarGroups:
+  - name: soapbox-shared
+    envVars:
+      - key: DISCORD_TOKEN
+        sync: false
+      - key: SOAPBOX_API_KEY
+        sync: false
+      - key: DATA_DIR
+        value: /data
