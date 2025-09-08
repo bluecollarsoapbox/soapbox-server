@@ -7,34 +7,34 @@ services:
     repo: https://github.com/bluecollarsoapbox/soapbox-server
     branch: main
     buildCommand: npm ci
-    # Seed /data the first time, then start your combined bot+API (bot.js)
-    startCommand: >
-      bash -lc '
-        mkdir -p /data/Stories /data/Spotlights &&
-        cp -nR /opt/render/project/src/Stories/* /data/Stories/ 2>/dev/null || true &&
-        cp -nR /opt/render/project/src/Spotlights/* /data/Spotlights/ 2>/dev/null || true &&
-        node bot.js
-      '
-    healthCheckPath: /health
+    startCommand: node bot.js
     autoDeploy: true
+    healthCheckPath: /health
 
-    # Pull your shared envs (edit the name if your group is different),
-    # or list values inline below (NODE_ENV/DISCORD_TOKEN/SOAPBOX_API_KEY/etc.)
     envVars:
-      - fromGroup: soapbox-shared
       - key: NODE_ENV
         value: production
+
+      # Your public API base (what the app points to)
+      - key: PUBLIC_API_BASE
+        value: https://soapbox-server.onrender.com
+
+      # Persisted data paths (match your code’s defaults)
       - key: DATA_DIR
         value: /data
       - key: STORIES_ROOT
         value: /data/Stories
       - key: SPOTLIGHT_FEED_DIR
         value: /data/Spotlights
-      # If you don't use an env group, uncomment and set these here:
-      # - key: DISCORD_TOKEN
-      #   value: <your-bot-token>
-      # - key: SOAPBOX_API_KEY
-      #   value: 99dnfneeekdegnrJJSN3JdenrsdnJ
+
+      # App-to-server auth key (the one your app sends in x-soapbox-key)
+      - key: SOAPBOX_API_KEY
+        # put the same value your app uses
+        value: 99dnfneeekdegnrJJSN3JdenrsdnJ
+
+      # Discord bot token (store as a Render Secret and reference it)
+      - key: DISCORD_TOKEN
+        fromSecret: DISCORD_TOKEN
 
     disk:
       name: soapbox-data
