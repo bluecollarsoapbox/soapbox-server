@@ -1,34 +1,55 @@
-# render.yaml — 2 services only: API (web) + Bot (worker)
+# render.yaml — production-grade split: Web API + Bot worker, shared env & disk
 services:
+  # --- Web API (Express) ---
   - type: web
     name: soapbox-api
     env: node
     plan: starter
-    rootDir: soapbox-server
     buildCommand: npm ci
-    startCommand: node server.js        # <- your Express entry
+    startCommand: node server.js
     autoDeploy: true
     healthCheckPath: /health
     envVars:
       - fromGroup: soapbox-shared
     disk:
       name: soapbox-data
-      mountPath: /data
+      mountPath: /opt/render/project/data
 
+  # --- Discord Bot (background worker) ---
   - type: worker
     name: soapbox-bot
     env: node
     plan: starter
-    rootDir: soapbox-server
     buildCommand: npm ci
-    startCommand: node bot.js           # <- your Discord bot entry
+    startCommand: node bot.js
     autoDeploy: true
     envVars:
       - fromGroup: soapbox-shared
     disk:
       name: soapbox-data
-      mountPath: /data
+      mountPath: /opt/render/project/data
 
+# One persistent disk, mounted into both services
 disks:
   - name: soapbox-data
     sizeGB: 1
+
+# Single source of truth for configuration/secrets
+envVarGroups:
+  - name: soapbox-shared
+    envVars:
+      - key: NODE_VERSION
+        value: 18.20.4
+      - key: DATA_DIR
+        value: /opt/render/project/data
+      - key: STORIES_ROOT
+        value: /opt/render/project/data/Stories
+      - key: SPOTLIGHT_FEED_DIR
+        value: /opt/render/project/data/Spotlights
+      - key: SOAPBOX_API_KEY
+        generateValue: true
+      - key: WATCH_DIR
+        value: ""   # keep empty on Render; you can set a path later if you really want the watcher
+      # ⚠️ placeholder — set the real token in Render after the blueprint is created
+      - key: DISCORD_TOKEN
+        value: "__SET_IN_RENDER__"
