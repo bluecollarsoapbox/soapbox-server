@@ -1,7 +1,6 @@
-// server.js — Blue Collar Soapbox API (Render-safe)
+// server.js — Blue Collar Soapbox API (Render-safe, no morgan)
 const express = require('express');
 const cors = require('cors');
-// const morgan = require('morgan'); // removed
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
@@ -14,15 +13,22 @@ app.set('trust proxy', 1);
 app.use(cors());
 app.use(express.json({ limit: '2mb' }));
 app.use(express.urlencoded({ extended: true, limit: '2mb' }));
-// app.use(morgan(process.env.NODE_ENV === 'production' ? 'combined' : 'dev')); // removed
 
 // ---------- Paths / dirs ----------
 const ROOT = __dirname;
-const STORIES_DIR = path.join(ROOT, 'Stories');
-const SPOTLIGHTS_DIR = path.join(ROOT, 'Spotlights');
-const CONFESSIONS_DIR = path.join(ROOT, 'Confessions'); // optional
-const VOICEMAILS_DIR = path.join(ROOT, 'Voicemails For Discord'); // your folder name
-const DATA_DIR = process.env.DATA_DIR || path.join(ROOT, 'data'); // for queued writes
+
+// IMPORTANT: default to Render's persistent, writable path
+const DATA_DIR = (process.env.DATA_DIR && process.env.DATA_DIR.trim())
+  ? process.env.DATA_DIR.trim()
+  : '/opt/render/project/data';
+
+// Keep your original content roots, but fall back to DATA_DIR subfolders so it's writeable on Render
+const STORIES_DIR       = process.env.STORIES_ROOT        || path.join(DATA_DIR, 'Stories');
+const SPOTLIGHTS_DIR    = process.env.SPOTLIGHT_FEED_DIR  || path.join(DATA_DIR, 'Spotlights');
+const CONFESSIONS_DIR   = process.env.CONFESSIONS_DIR     || path.join(DATA_DIR, 'Confessions');
+const VOICEMAILS_DIR    = process.env.VOICEMAILS_DIR      || path.join(DATA_DIR, 'Voicemails For Discord');
+
+// Ensure the base data dir exists
 fs.mkdirSync(DATA_DIR, { recursive: true });
 
 // ---------- Helpers ----------
@@ -44,16 +50,15 @@ const listAudioFiles = (dir) => {
     .readdirSync(dir)
     .filter((f) => exts.has(path.extname(f).toLowerCase()))
     .map((filename) => {
-      // Create a stable, non-reversible id (sha1 of filename)
+      // Stable, non-reversible id
       const id = crypto.createHash('sha1').update(filename).digest('hex');
       const full = path.join(dir, filename);
       const stat = fs.statSync(full);
       return {
-        id,                     // used for streaming
-        // DO NOT return the filename (might contain phone numbers)
+        id, // used for streaming
         size: stat.size,
-        createdAt: stat.mtime.toISOString(),
-        ext: path.extname(filename).toLowerCase().slice(1)
+        createdAt: (stat.mtime || stat.ctime || new Date()).toISOString(),
+        ext: path.extname(filename).toLowerCase().slice(1),
       };
     });
 };
@@ -62,14 +67,13 @@ const guessMime = (ext) => {
   switch (ext.toLowerCase()) {
     case '.mp3': return 'audio/mpeg';
     case '.wav': return 'audio/wav';
-    case '.m4a': return 'audio/mp4'; // m4a/aac container
+    case '.m4a': return 'audio/mp4';
     case '.aac': return 'audio/aac';
     case '.ogg': return 'audio/ogg';
     default: return 'application/octet-stream';
   }
 };
 
-// Build a map of id -> absolute file path on demand
 const buildVoicemailIndex = () => {
   const files = fs.existsSync(VOICEMAILS_DIR) ? fs.readdirSync(VOICEMAILS_DIR) : [];
   const map = new Map();
@@ -83,32 +87,30 @@ const buildVoicemailIndex = () => {
 };
 
 // ---------- Health ----------
-app.get('/health', (req, res) => res.status(200).json({ ok: true }));
+app.get('/health', (_req, res) => res.status(200).json({ ok: true }));
 
 // ---------- Stories ----------
-app.get('/stories', (req, res) => {
+app.get('/stories', (_req, res) => {
   const file = path.join(STORIES_DIR, 'metadata.json');
   const data = readJSON(file, []);
   res.json(Array.isArray(data) ? data : []);
 });
 
 // ---------- Spotlights ----------
-app.get('/spotlights', (req, res) => {
+app.get('/spotlights', (_req, res) => {
   const file = path.join(SPOTLIGHTS_DIR, 'metadata.json');
   const data = readJSON(file, []);
   res.json(Array.isArray(data) ? data : []);
 });
 
 // ---------- Confessions ----------
-// GET list (if you maintain a metadata file). Otherwise returns [].
-app.get('/confessions', (req, res) => {
+app.get('/confessions', (_req, res) => {
   const file = path.join(CONFESSIONS_DIR, 'metadata.json');
   const data = readJSON(file, []);
   res.json(Array.isArray(data) ? data : []);
 });
 
-// POST a new confession -> queued to disk (no auth by default).
-// Your moderation/Discord bot can pick these up from DATA_DIR later.
+// Queue a new confession to disk (no auth by default)
 app.post('/confessions', (req, res) => {
   const { text } = req.body || {};
   if (!text || typeof text !== 'string' || !text.trim()) {
@@ -122,9 +124,8 @@ app.post('/confessions', (req, res) => {
   res.json({ ok: true, id });
 });
 
-// ---------- Voicemails (no key required) ----------
-// Returns a list with SAFE fields only; no filenames.
-app.get('/voicemails', (req, res) => {
+// ---------- Voicemails ----------
+app.get('/voicemails', (_req, res) => {
   try {
     const list = listAudioFiles(VOICEMAILS_DIR);
     res.json(list);
@@ -134,7 +135,7 @@ app.get('/voicemails', (req, res) => {
   }
 });
 
-// Streams audio inline by id (never reveals filename).
+// Stream by id (never reveals real filenames)
 app.get('/voicemails/:id/stream', (req, res) => {
   const index = buildVoicemailIndex();
   const filePath = index.get(req.params.id);
@@ -145,7 +146,6 @@ app.get('/voicemails/:id/stream', (req, res) => {
   const ext = path.extname(filePath);
   const mime = guessMime(ext);
 
-  // Inline playback with a generic name:
   res.setHeader('Content-Type', mime);
   res.setHeader('Content-Disposition', `inline; filename="voicemail${ext}"`);
   res.setHeader('Accept-Ranges', 'bytes');
@@ -169,18 +169,19 @@ app.get('/voicemails/:id/stream', (req, res) => {
 });
 
 // ---------- Root ----------
-app.get('/', (req, res) => res.type('text').send('Blue Collar Soapbox API running.'));
+app.get('/', (_req, res) => res.type('text').send('Blue Collar Soapbox API running.'));
 
 // ---------- 404 & Error ----------
-app.use((req, res) => res.status(404).json({ error: 'Not found' }));
-app.use((err, req, res, next) => {
+app.use((_req, res) => res.status(404).json({ error: 'Not found' }));
+app.use((err, _req, res, _next) => {
   console.error('API error:', err);
   res.status(err.status || 500).json({ error: err.message || 'Server error' });
 });
 
 // ---------- Start ----------
-const PORT = process.env.PORT || 3030;
-app.listen(PORT, '0.0.0.0', () => {
-  console.log(`API listening on http://0.0.0.0:${PORT}`);
+const PORT = Number(process.env.PORT) || 3030;
+const HOST = '0.0.0.0';
+app.listen(PORT, HOST, () => {
+  console.log(`[BOOT] DATA_DIR=${DATA_DIR}`);
+  console.log(`API listening on http://${HOST}:${PORT}`);
 });
-
