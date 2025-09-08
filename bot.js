@@ -32,14 +32,22 @@ const SPOTLIGHT_CHANNEL_ID = '1411392998427856907';
 // ---- Folders (portable via .env; Windows defaults only on your PC) ----
 const API_PORT = process.env.PORT ? Number(process.env.PORT) : 3030;
 
+// Base paths (portable across Render Linux and your Windows dev box)
+const LINUX_DATA = fs.existsSync('/data') ? '/data' : null;               // Render’s mounted disk if present
+const WIN_ROOT   = 'D:\\Soapbox App';
+
 // Base data folder used by all JSON/state
-const DATA_DIR = process.env.DATA_DIR || 'D:\\Soapbox App\\data';
+const DATA_DIR = process.env.DATA_DIR
+  || (LINUX_DATA ? path.join(LINUX_DATA) : path.join(WIN_ROOT, 'data'));
 
 // Spotlight feed (folders you create for each video)
-const SPOTLIGHT_FEED_DIR = process.env.SPOTLIGHT_FEED_DIR || 'D:\\Soapbox App\\Spotlights';
+const SPOTLIGHT_FEED_DIR = process.env.SPOTLIGHT_FEED_DIR
+  || (LINUX_DATA ? path.join(LINUX_DATA, 'Spotlights') : path.join(WIN_ROOT, 'Spotlights'));
 
 // Stories root (Story1/Story2/... with metadata/voicemail/witnesses)
-const STORIES_ROOT = process.env.STORIES_ROOT || 'D:\\Soapbox App\\Stories';
+const STORIES_ROOT = process.env.STORIES_ROOT
+  || (LINUX_DATA ? path.join(LINUX_DATA, 'Stories') : path.join(WIN_ROOT, 'Stories'));
+
 
 // Old voicemail drop folder the watcher still supports (empty by default on servers)
 const WATCH_DIR = process.env.WATCH_DIR || '';  // <<< IMPORTANT: no Windows fallback here
