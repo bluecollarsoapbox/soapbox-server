@@ -7,7 +7,7 @@ services:
     repo: https://github.com/bluecollarsoapbox/soapbox-server
     branch: main
     buildCommand: npm ci
-    startCommand: node server.js
+    startCommand: node scripts/seed-data.js && node server.js
     autoDeploy: true
     envVars:
       - key: NODE_ENV
@@ -33,7 +33,7 @@ services:
     repo: https://github.com/bluecollarsoapbox/soapbox-server
     branch: main
     buildCommand: npm ci
-    startCommand: node bot.js
+    startCommand: node scripts/seed-data.js && node server.js
     autoDeploy: true
     envVars:
       - key: NODE_ENV
