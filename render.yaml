@@ -9,11 +9,17 @@ services:
     buildCommand: npm ci
     startCommand: node server.js
     autoDeploy: true
-    envVarGroups:
-      - soapbox-shared
     envVars:
       - key: NODE_ENV
         value: production
+      - key: DATA_DIR
+        value: /opt/render/project/data
+      - key: PUBLIC_API_BASE
+        value: https://soapbox-server.onrender.com
+      - key: SPOTLIGHT_FEED_DIR
+        value: /opt/render/project/data/Spotlights
+      - key: STORIES_ROOT
+        value: /opt/render/project/data/Stories
     disk:
       name: soapbox-data
       mountPath: /opt/render/project/data
@@ -29,11 +35,17 @@ services:
     buildCommand: npm ci
     startCommand: node bot.js
     autoDeploy: true
-    envVarGroups:
-      - soapbox-shared
     envVars:
       - key: NODE_ENV
         value: production
+      - key: DATA_DIR
+        value: /opt/render/project/data
+      - key: PUBLIC_API_BASE
+        value: https://soapbox-server.onrender.com
+      - key: SPOTLIGHT_FEED_DIR
+        value: /opt/render/project/data/Spotlights
+      - key: STORIES_ROOT
+        value: /opt/render/project/data/Stories
     disk:
       name: soapbox-data
       mountPath: /opt/render/project/data
