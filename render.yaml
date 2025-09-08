@@ -10,32 +10,25 @@ services:
     startCommand: node bot.js
     autoDeploy: true
     healthCheckPath: /health
-
     envVars:
-      - key: NODE_ENV
-        value: production
+      - fromGroup: soapbox-shared   # 👈 pulls in DISCORD_TOKEN, SOAPBOX_API_KEY, DATA_DIR, etc.
+    disk:
+      name: soapbox-data
+      mountPath: /data
+      sizeGB: 5
 
-      # Your public API base (what the app points to)
-      - key: PUBLIC_API_BASE
-        value: https://soapbox-server.onrender.com
-
-      # Persisted data paths (match your code’s defaults)
-      - key: DATA_DIR
-        value: /data
-      - key: STORIES_ROOT
-        value: /data/Stories
-      - key: SPOTLIGHT_FEED_DIR
-        value: /data/Spotlights
-
-      # App-to-server auth key (the one your app sends in x-soapbox-key)
-      - key: SOAPBOX_API_KEY
-        # put the same value your app uses
-        value: 99dnfneeekdegnrJJSN3JdenrsdnJ
-
-      # Discord bot token (store as a Render Secret and reference it)
-      - key: DISCORD_TOKEN
-        fromSecret: DISCORD_TOKEN
-
+  - type: worker
+    name: soapbox-bot
+    env: node
+    plan: starter
+    region: virginia
+    repo: https://github.com/bluecollarsoapbox/soapbox-server
+    branch: main
+    buildCommand: npm ci
+    startCommand: node bot.js
+    autoDeploy: true
+    envVars:
+      - fromGroup: soapbox-shared   # 👈 same env group for the worker
     disk:
       name: soapbox-data
       mountPath: /data
