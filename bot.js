@@ -18,11 +18,7 @@ const multer = require('multer');
 const { Client, GatewayIntentBits, AttachmentBuilder, ChannelType } = require('discord.js');
 
 // ---- Secrets (.env) ----
-// (CHANGED) Normalize and log the token safely (first/last 4 chars + length)
-let tokenRaw = process.env.DISCORD_TOKEN ?? '';
-tokenRaw = typeof tokenRaw === 'string' ? tokenRaw.trim() : '';
-console.log('[BOOT] DISCORD_TOKEN ->', tokenRaw ? `${tokenRaw.slice(0,4)}…${tokenRaw.slice(-4)} len=${tokenRaw.length}` : 'MISSING');
-const TOKEN   = tokenRaw;                                                   // REQUIRED
+const TOKEN   = process.env.DISCORD_TOKEN;                         // REQUIRED
 const API_KEY = process.env.SOAPBOX_API_KEY || '99dnfneeekdegnrJJSN3JdenrsdnJ';
 
 // ---- Discord channels ----
@@ -122,7 +118,7 @@ async function renameSafe(oldFull){
 async function postVoicemail(filePath){
   const ch = await client.channels.fetch(VOICEMAIL_CHANNEL_ID);
   const att = new AttachmentBuilder(filePath);
-  await ch.send({ content: `📢 **New Hotline Voicemail (323-743-3744)**`, files: [att] });  
+  await ch.send({ content: `📢 **New Hotline Voicemail (323-743-3744)**`, files: [att] }); 
   console.log('✅ Posted voicemail:', path.basename(filePath));
 }
 
@@ -150,7 +146,7 @@ function readTextSafe(fp){
 
 function getLocalIp(){
   const ifs = os.networkInterfaces();
-  for (const name of Object.keys(ifs)) for (const net of (ifs[name] || [])) {
+  for (const name of Object.keys(ifs)) for (const net of ifs[name] || []) {
     if (net.family === 'IPv4' && !net.internal) return net.address;
   }
   return 'localhost';
