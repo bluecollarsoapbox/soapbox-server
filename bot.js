@@ -17,10 +17,18 @@ const cors = require('cors');
 const multer = require('multer');
 const { Client, GatewayIntentBits, AttachmentBuilder, ChannelType } = require('discord.js');
 
-// ---- Secrets (.env) ----
-const TOKEN = (process.env.DISCORD_TOKEN || '').trim();            // REQUIRED (trim to strip stray spaces/newlines)
+// ---- Secrets (.env or Render Secret File) ----
+const fs = require('fs'); // (already required above; if not, keep this)
+function getDiscordToken() {
+  const fromEnv = (process.env.DISCORD_TOKEN || '').trim();
+  if (fromEnv) return fromEnv;
+  try { return fs.readFileSync('/etc/secrets/DISCORD_TOKEN', 'utf8').trim(); } catch {}
+  try { return fs.readFileSync('/etc/secrets/discord_token', 'utf8').trim(); } catch {}
+  return '';
+}
+const TOKEN = getDiscordToken();
 if (!TOKEN) {
-  console.error('❌ DISCORD_TOKEN is empty or missing (after trim). Check Render env vars.');
+  console.error('❌ DISCORD_TOKEN is empty or missing. Set env var or Secret File /etc/secrets/DISCORD_TOKEN.');
   process.exit(1);
 }
 console.log('[ENV] DISCORD_TOKEN length:', TOKEN.length);
