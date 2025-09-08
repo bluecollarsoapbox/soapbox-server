@@ -9,7 +9,8 @@ services:
     buildCommand: npm ci
     startCommand: node server.js
     autoDeploy: true
-    envVarsFromGroup: soapbox-shared
+    envVarGroups:
+      - soapbox-shared
     envVars:
       - key: NODE_ENV
         value: production
@@ -28,7 +29,8 @@ services:
     buildCommand: npm ci
     startCommand: node bot.js
     autoDeploy: true
-    envVarsFromGroup: soapbox-shared
+    envVarGroups:
+      - soapbox-shared
     envVars:
       - key: NODE_ENV
         value: production
