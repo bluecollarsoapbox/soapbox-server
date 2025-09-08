@@ -3,14 +3,13 @@ services:
     name: soapbox-server
     env: node
     plan: standard
-    region: virginia         # or "oregon" — pick one and use it for both
+    region: virginia
     repo: https://github.com/bluecollarsoapbox/soapbox-server
     branch: main
     buildCommand: npm ci
     startCommand: node server.js
     autoDeploy: true
-    envVarGroups:
-      - soapbox-shared
+    envVarsFromGroup: soapbox-shared
     envVars:
       - key: NODE_ENV
         value: production
@@ -23,14 +22,13 @@ services:
     name: soapbox-bot
     env: node
     plan: starter
-    region: virginia         # match the web service’s region
+    region: virginia
     repo: https://github.com/bluecollarsoapbox/soapbox-server
     branch: main
     buildCommand: npm ci
     startCommand: node bot.js
     autoDeploy: true
-    envVarGroups:
-      - soapbox-shared
+    envVarsFromGroup: soapbox-shared
     envVars:
       - key: NODE_ENV
         value: production
