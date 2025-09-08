@@ -1,54 +1,40 @@
 services:
-  # ------------------ API (Express server.js) ------------------
   - type: web
-    name: soapbox-server        # 👈 API service name
+    name: soapbox-server
     env: node
-    plan: starter
-    buildCommand: "npm install"
-    startCommand: "node server.js"
+    plan: standard
+    region: virginia         # or "oregon" — pick one and use it for both
+    repo: https://github.com/bluecollarsoapbox/soapbox-server
     branch: main
+    buildCommand: npm ci
+    startCommand: node server.js
     autoDeploy: true
+    envVarGroups:
+      - soapbox-shared
+    envVars:
+      - key: NODE_ENV
+        value: production
     disk:
       name: soapbox-data
       mountPath: /opt/render/project/data
       sizeGB: 1
-    envVars:
-      - key: DATA_DIR
-        value: /opt/render/project/data
-      - key: STORIES_ROOT
-        value: /opt/render/project/data/Stories
-      - key: SPOTLIGHT_FEED_DIR
-        value: /opt/render/project/data/Spotlights
-      - key: CONFESSIONS_DIR
-        value: /opt/render/project/data/Confessions
-      - key: VOICEMAILS_DIR
-        value: /opt/render/project/data/Voicemails For Discord
 
-  # ------------------ Discord Bot (bot.js) ------------------
   - type: worker
-    name: soapbox-bot           # 👈 background worker for Discord bot
+    name: soapbox-bot
     env: node
     plan: starter
-    buildCommand: "npm install"
-    startCommand: "node bot.js"
+    region: virginia         # match the web service’s region
+    repo: https://github.com/bluecollarsoapbox/soapbox-server
     branch: main
+    buildCommand: npm ci
+    startCommand: node bot.js
     autoDeploy: true
+    envVarGroups:
+      - soapbox-shared
+    envVars:
+      - key: NODE_ENV
+        value: production
     disk:
       name: soapbox-data
       mountPath: /opt/render/project/data
       sizeGB: 1
-    envVars:
-      - key: DATA_DIR
-        value: /opt/render/project/data
-      - key: STORIES_ROOT
-        value: /opt/render/project/data/Stories
-      - key: SPOTLIGHT_FEED_DIR
-        value: /opt/render/project/data/Spotlights
-      - key: CONFESSIONS_DIR
-        value: /opt/render/project/data/Confessions
-      - key: VOICEMAILS_DIR
-        value: /opt/render/project/data/Voicemails For Discord
-      - key: DISCORD_TOKEN       # 👈 set in Render dashboard (secret)
-        sync: false
-      - key: SOAPBOX_API_KEY     # 👈 set in Render dashboard (secret)
-        sync: false
