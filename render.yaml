@@ -1,13 +1,17 @@
 services:
   # ------------------ API (Express server.js) ------------------
   - type: web
-    name: soapbox-server        # 👈 this is your API service name
+    name: soapbox-server        # 👈 API service name
     env: node
     plan: starter
     buildCommand: "npm install"
     startCommand: "node server.js"
     branch: main
     autoDeploy: true
+    disk:
+      name: soapbox-data
+      mountPath: /opt/render/project/data
+      sizeGB: 1
     envVars:
       - key: DATA_DIR
         value: /opt/render/project/data
@@ -29,6 +33,10 @@ services:
     startCommand: "node bot.js"
     branch: main
     autoDeploy: true
+    disk:
+      name: soapbox-data
+      mountPath: /opt/render/project/data
+      sizeGB: 1
     envVars:
       - key: DATA_DIR
         value: /opt/render/project/data
@@ -40,7 +48,7 @@ services:
         value: /opt/render/project/data/Confessions
       - key: VOICEMAILS_DIR
         value: /opt/render/project/data/Voicemails For Discord
-      - key: DISCORD_TOKEN       # 👈 must be set in Render dashboard (secret)
+      - key: DISCORD_TOKEN       # 👈 set in Render dashboard (secret)
         sync: false
-      - key: SOAPBOX_API_KEY     # 👈 must be set in Render dashboard (secret)
+      - key: SOAPBOX_API_KEY     # 👈 set in Render dashboard (secret)
         sync: false
