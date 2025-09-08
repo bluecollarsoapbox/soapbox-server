@@ -18,7 +18,6 @@ const multer = require('multer');
 const { Client, GatewayIntentBits, AttachmentBuilder, ChannelType } = require('discord.js');
 
 // ---- Secrets (.env or Render Secret File) ----
-const fs = require('fs'); // (already required above; if not, keep this)
 function getDiscordToken() {
   const fromEnv = (process.env.DISCORD_TOKEN || '').trim();
   if (fromEnv) return fromEnv;
