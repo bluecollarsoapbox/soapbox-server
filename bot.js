@@ -27,6 +27,9 @@ console.log('[ENV] DISCORD_TOKEN length:', TOKEN.length);
 
 const API_KEY = process.env.SOAPBOX_API_KEY || '99dnfneeekdegnrJJSN3JdenrsdnJ';
 
+// ✅ NEW: optional public API base for links posted to Discord
+const PUBLIC_API_BASE = (process.env.PUBLIC_API_BASE || process.env.API_BASE_URL || '').trim();
+
 // ---- Discord channels ----
 const VOICEMAIL_CHANNEL_ID   = '1407177470997696562';
 const CONFESSIONS_CHANNEL_ID = '1407177292605685932';
@@ -38,8 +41,9 @@ const SPOTLIGHT_CHANNEL_ID = '1411392998427856907';
 // ---- Folders (portable via .env; Windows defaults only on your PC) ----
 const API_PORT = process.env.PORT ? Number(process.env.PORT) : 3030;
 
-// Base paths (portable across Render Linux and your Windows dev box)
-const LINUX_DATA = fs.existsSync('/data') ? '/data' : null;               // Render’s mounted disk if present
+// ✅ CHANGED: prefer Render’s real persistent path when present
+const RENDER_DATA = '/opt/render/project/data';
+const LINUX_DATA = fs.existsSync(RENDER_DATA) ? RENDER_DATA : null; // Render’s mounted disk if present
 const WIN_ROOT   = 'D:\\Soapbox App';
 
 // Base data folder used by all JSON/state
@@ -53,7 +57,6 @@ const SPOTLIGHT_FEED_DIR = process.env.SPOTLIGHT_FEED_DIR
 // Stories root (Story1/Story2/... with metadata/voicemail/witnesses)
 const STORIES_ROOT = process.env.STORIES_ROOT
   || (LINUX_DATA ? path.join(LINUX_DATA, 'Stories') : path.join(WIN_ROOT, 'Stories'));
-
 
 // Old voicemail drop folder the watcher still supports (empty by default on servers)
 const WATCH_DIR = process.env.WATCH_DIR || '';  // <<< IMPORTANT: no Windows fallback here
@@ -124,7 +127,7 @@ async function renameSafe(oldFull){
 async function postVoicemail(filePath){
   const ch = await client.channels.fetch(VOICEMAIL_CHANNEL_ID);
   const att = new AttachmentBuilder(filePath);
-  await ch.send({ content: `📢 **New Hotline Voicemail (323-743-3744)**`, files: [att] }); 
+  await ch.send({ content: `📢 **New Hotline Voicemail (323-743-3744)**`, files: [att] });
   console.log('✅ Posted voicemail:', path.basename(filePath));
 }
 
@@ -137,7 +140,7 @@ function ensureData(){
 
   // NEW: if you configured WATCH_DIR, make sure it exists so we can actually watch it
   if (WATCH_DIR) {
-    try { fs.mkdirSync(WATCH_DIR, { recursive: true }); } 
+    try { fs.mkdirSync(WATCH_DIR, { recursive: true }); }
     catch (e) { console.warn('Could not create WATCH_DIR:', WATCH_DIR, e?.message || e); }
   }
 }
@@ -317,8 +320,12 @@ async function ensureStoryThread(storyId){
 
   // Build the current content
   const { title, subtitle, thumbAbs, thumbName } = readStoryPresentation(storyId);
+
+  // ✅ CHANGED: prefer a public base URL if provided
   const ip = getLocalIp();
-  const voicemailUrl = `http://${ip}:${API_PORT}/voicemail/${storyId}`;
+  const voicemailUrl = PUBLIC_API_BASE
+    ? `${PUBLIC_API_BASE}/voicemail/${encodeURIComponent(storyId)}`
+    : `http://${ip}:${API_PORT}/voicemail/${storyId}`;
 
   const contentLines = [
     `**${title}**`,
