@@ -1,31 +1,16 @@
-# render.yaml — Soapbox (API + Bot) with one persistent disk
-
 services:
-  # -------------------- API (web) --------------------
+  # ------------------ API (Express server.js) ------------------
   - type: web
-    name: soapbox-api
-    runtime: node
+    name: soapbox-server        # 👈 this is your API service name
+    env: node
     plan: starter
-    region: virginia                 # or oregon/frankfurt/etc
-    repo: https://github.com/<you>/soapbox-server
+    buildCommand: "npm install"
+    startCommand: "node server.js"
     branch: main
-    buildCommand: npm ci
-    startCommand: node server.js
-    healthCheckPath: /health
-    autoDeployTrigger: commit
-
+    autoDeploy: true
     envVars:
-      # Public-ish config
-      - key: NODE_ENV
-        value: production
-      - key: PORT
-        value: 3030
-
-      # Important: point your app at Render's persistent path
       - key: DATA_DIR
         value: /opt/render/project/data
-
-      # Optional: set these if your server reads them
       - key: STORIES_ROOT
         value: /opt/render/project/data/Stories
       - key: SPOTLIGHT_FEED_DIR
@@ -35,57 +20,27 @@ services:
       - key: VOICEMAILS_DIR
         value: /opt/render/project/data/Voicemails For Discord
 
-    disk:                             # << correct key (singular)
-      name: soapbox-data
-      mountPath: /opt/render/project/data
-      sizeGB: 1
-
-  # -------------------- Discord Bot (worker) --------------------
+  # ------------------ Discord Bot (bot.js) ------------------
   - type: worker
-    name: soapbox-bot
-    runtime: node
+    name: soapbox-bot           # 👈 background worker for Discord bot
+    env: node
     plan: starter
-    region: virginia
-    repo: https://github.com/<you>/soapbox-server
-    rootDir: .                       # change if bot.js lives in subfolder
+    buildCommand: "npm install"
+    startCommand: "node bot.js"
     branch: main
-    buildCommand: npm ci
-    startCommand: node bot.js
-    autoDeployTrigger: commit
-
+    autoDeploy: true
     envVars:
-      - key: NODE_ENV
-        value: production
-
-      # Persist paths used by bot.js
       - key: DATA_DIR
         value: /opt/render/project/data
       - key: STORIES_ROOT
         value: /opt/render/project/data/Stories
       - key: SPOTLIGHT_FEED_DIR
         value: /opt/render/project/data/Spotlights
-      - key: WATCH_DIR
-        value: ""                     # empty = watcher disabled on Render
-
-      # Secrets — you’ll be prompted to enter these when you create the Blueprint
-      - key: DISCORD_TOKEN
+      - key: CONFESSIONS_DIR
+        value: /opt/render/project/data/Confessions
+      - key: VOICEMAILS_DIR
+        value: /opt/render/project/data/Voicemails For Discord
+      - key: DISCORD_TOKEN       # 👈 must be set in Render dashboard (secret)
         sync: false
-      - key: SOAPBOX_API_KEY
+      - key: SOAPBOX_API_KEY     # 👈 must be set in Render dashboard (secret)
         sync: false
-
-    disk:                             # << correct key (singular)
-      name: soapbox-data
-      mountPath: /opt/render/project/data
-      sizeGB: 1
-
-  # -------------------- Expo Web (optional) --------------------
-  # If you also want to host a web build from the soapbox-app repo, uncomment below
-  # - type: web
-  #   name: soapbox-app-web
-  #   runtime: static
-  #   repo: https://github.com/<you>/soapbox-app
-  #   branch: main
-  #   buildCommand: |
-  #     npm ci
-  #     npx expo export --platform web --output-dir build
-  #   staticPublishPath: build
