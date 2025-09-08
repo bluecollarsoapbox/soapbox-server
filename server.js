@@ -180,7 +180,7 @@ app.use((err, req, res, next) => {
 
 // ---------- Start ----------
 const PORT = process.env.PORT || 3030;
-const HOST = '0.0.0.0';
-app.listen(PORT, HOST, () => {
-  console.log(`API listening on http://${HOST}:${PORT}`);
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`API listening on http://0.0.0.0:${PORT}`);
 });
+
