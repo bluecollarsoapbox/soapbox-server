@@ -18,7 +18,13 @@ const multer = require('multer');
 const { Client, GatewayIntentBits, AttachmentBuilder, ChannelType } = require('discord.js');
 
 // ---- Secrets (.env) ----
-const TOKEN   = process.env.DISCORD_TOKEN;                         // REQUIRED
+const TOKEN = (process.env.DISCORD_TOKEN || '').trim();            // REQUIRED (trim to strip stray spaces/newlines)
+if (!TOKEN) {
+  console.error('❌ DISCORD_TOKEN is empty or missing (after trim). Check Render env vars.');
+  process.exit(1);
+}
+console.log('[ENV] DISCORD_TOKEN length:', TOKEN.length);
+
 const API_KEY = process.env.SOAPBOX_API_KEY || '99dnfneeekdegnrJJSN3JdenrsdnJ';
 
 // ---- Discord channels ----
