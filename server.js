@@ -1,4 +1,5 @@
 // server.js — Blue Collar Soapbox API (Render-safe, no morgan)
+
 const express = require('express');
 const cors = require('cors');
 const fs = require('fs');
@@ -7,27 +8,31 @@ const crypto = require('crypto');
 
 const app = express();
 
-// ---------- Middleware ----------
+// ---------- Core settings & middleware ----------
 app.disable('x-powered-by');
 app.set('trust proxy', 1);
 app.use(cors());
-app.use(express.json({ limit: '2mb' }));
-app.use(express.urlencoded({ extended: true, limit: '2mb' }));
-app.use("/api", require("./routes/witness-s3"));
+
+// Use one set of body parsers (avoid duplicates)
+app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ extended: true, limit: '10mb' }));
+
+// Mount the S3 witness route (exposes POST /api/witness)
+app.use(require('./routes/witness-s3'));
 
 // ---------- Paths / dirs ----------
 const ROOT = __dirname;
 
 // IMPORTANT: default to Render's persistent, writable path
-const DATA_DIR = (process.env.DATA_DIR && process.env.DATA_DIR.trim())
-  ? process.env.DATA_DIR.trim()
-  : '/opt/render/project/data';
+const DATA_DIR =
+  (process.env.DATA_DIR && process.env.DATA_DIR.trim()) ||
+  '/opt/render/project/data';
 
 // Keep your original content roots, but fall back to DATA_DIR subfolders so it's writeable on Render
-const STORIES_DIR       = process.env.STORIES_ROOT        || path.join(DATA_DIR, 'Stories');
-const SPOTLIGHTS_DIR    = process.env.SPOTLIGHT_FEED_DIR  || path.join(DATA_DIR, 'Spotlights');
-const CONFESSIONS_DIR   = process.env.CONFESSIONS_DIR     || path.join(DATA_DIR, 'Confessions');
-const VOICEMAILS_DIR    = process.env.VOICEMAILS_DIR      || path.join(DATA_DIR, 'Voicemails For Discord');
+const STORIES_DIR     = process.env.STORIES_ROOT       || path.join(DATA_DIR, 'Stories');
+const SPOTLIGHTS_DIR  = process.env.SPOTLIGHT_FEED_DIR || path.join(DATA_DIR, 'Spotlights');
+const CONFESSIONS_DIR = process.env.CONFESSIONS_DIR    || path.join(DATA_DIR, 'Confessions');
+const VOICEMAILS_DIR  = process.env.VOICEMAILS_DIR     || path.join(DATA_DIR, 'Voicemails For Discord');
 
 // Ensure the base data dir exists
 fs.mkdirSync(DATA_DIR, { recursive: true });
