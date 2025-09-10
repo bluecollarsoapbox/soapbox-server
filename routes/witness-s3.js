@@ -40,6 +40,11 @@ function s3() {
   });
 }
 
+// --- simple health to prove router is mounted ---
+// ⬇️ put this ABOVE the auth middleware so it skips auth
+router.get('/witness/ping', (_req, res) => res.json({ ok: true }));
+
+
 function safeSlug(s) {
   return String(s || '')
     .normalize('NFKD')
