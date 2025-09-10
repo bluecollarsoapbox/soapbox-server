@@ -8,6 +8,10 @@ const path = require('path');
 const router = express.Router();
 
 // --- simple health to prove router is mounted ---
+// ⬇️ put this ABOVE the auth middleware so it skips auth
+router.get('/witness/ping', (_req, res) => res.json({ ok: true }));
+
+// --- simple health to prove router is mounted ---
 router.get('/witness/ping', (_req, res) => res.json({ ok: true }));
 
 // --- auth middleware: checks x-soapbox-key against env ---
@@ -39,11 +43,6 @@ function s3() {
     },
   });
 }
-
-// --- simple health to prove router is mounted ---
-// ⬇️ put this ABOVE the auth middleware so it skips auth
-router.get('/witness/ping', (_req, res) => res.json({ ok: true }));
-
 
 function safeSlug(s) {
   return String(s || '')
