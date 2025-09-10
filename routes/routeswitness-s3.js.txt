@@ -1,0 +1,142 @@
+// routes/witness-s3.js
+const path = require("path");
+const { PassThrough } = require("stream");
+const express = require("express");
+const multer = require("multer");
+const ffmpeg = require("fluent-ffmpeg");
+const ffmpegPath = require("ffmpeg-static");
+const fetch = require("node-fetch"); // v2
+const { S3Client, PutObjectCommand } = require("@aws-sdk/client-s3");
+
+ffmpeg.setFfmpegPath(ffmpegPath);
+
+const router = express.Router();
+
+// ---------- ENV ----------
+const API_KEY = process.env.SOAPBOX_API_KEY || "";
+const AWS_REGION = process.env.AWS_REGION || "us-east-2";
+const S3_BUCKET = process.env.S3_BUCKET || process.env.S3_BUCKET_NAME;
+const DISCORD_WEBHOOK_URL = process.env.DISCORD_WEBHOOK_URL || "";
+
+// ---------- S3 ----------
+const s3 = new S3Client({ region: AWS_REGION });
+
+// ---------- AUTH ----------
+function requireKey(req, res, next) {
+  const key = req.header("x-soapbox-key");
+  if (!API_KEY || key !== API_KEY) {
+    return res.status(401).json({ error: "Unauthorized" });
+  }
+  next();
+}
+
+// ---------- MULTER (in-memory) ----------
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 1024 * 1024 * 1024 } }); // up to 1GB
+
+// ---------- HELPERS ----------
+function s3KeyForOriginal(storyId, baseName) {
+  return `${storyId}/witnesses/originals/${baseName}`;
+}
+function s3KeyForPreview(storyId, baseName) {
+  return `${storyId}/witnesses/previews/${baseName}`;
+}
+async function putToS3(Key, Body, ContentType) {
+  await s3.send(new PutObjectCommand({
+    Bucket: S3_BUCKET,
+    Key,
+    Body,
+    ContentType,
+    ACL: "private",
+  }));
+  return { bucket: S3_BUCKET, key: Key };
+}
+
+// Create a readable stream from a Buffer
+function bufferToStream(buffer) {
+  const stream = new PassThrough();
+  stream.end(buffer);
+  return stream;
+}
+
+// ---------- ROUTE: POST /witness ----------
+router.post("/witness", requireKey, upload.single("video"), async (req, res) => {
+  try {
+    const { storyId, storyTitle = "" } = req.body || {};
+    if (!storyId) return res.status(400).json({ error: "Missing storyId" });
+    if (!req.file) return res.status(400).json({ error: "Missing video file" });
+
+    const originalMime = req.file.mimetype || "video/mp4";
+    const ts = new Date();
+    const stamp = ts.toISOString().replace(/[:.]/g, "-");
+    const safeTitle = (storyTitle || storyId).replace(/[^\w\- ]+/g, "").replace(/\s+/g, "_");
+    const baseName = `${safeTitle || storyId}_${stamp}.mp4`;
+
+    // 1) Upload ORIGINAL to S3
+    const originalKey = s3KeyForOriginal(storyId, baseName);
+    await putToS3(originalKey, req.file.buffer, originalMime);
+
+    // 2) Watermark to PREVIEW (full-screen, faded)
+    //    Filter: scale logo to main_w x main_h, add alpha, overlay top-left
+    const logoPath = path.join(__dirname, "..", "assets", "logo.png");
+    const inputStream = bufferToStream(req.file.buffer);
+    const watermarkedStream = new PassThrough();
+
+    const ff = ffmpeg({ timeout: 0 })
+      .input(inputStream)
+      .input(logoPath)
+      .complexFilter([
+        // [1] is logo: scale to video size, ensure RGBA, apply alpha (0.18 ~ 18% opacity)
+        "[1]scale=main_w:main_h,format=rgba,colorchannelmixer=aa=0.18[wm];[0:v][wm]overlay=0:0:format=auto"
+      ])
+      .outputOptions([
+        "-c:v libx264",
+        "-preset veryfast",
+        "-crf 23",
+        "-c:a copy",
+        "-movflags +faststart"
+      ])
+      .format("mp4")
+      .on("error", (err) => {
+        console.error("ffmpeg error:", err);
+        watermarkedStream.destroy(err);
+      })
+      .on("end", () => {
+        watermarkedStream.end();
+      });
+
+    ff.pipe(watermarkedStream);
+
+    // Upload the watermarked stream to S3
+    const previewKey = s3KeyForPreview(storyId, baseName);
+    await putToS3(previewKey, watermarkedStream, "video/mp4");
+
+    // 3) Post to Discord (optional)
+    if (DISCORD_WEBHOOK_URL) {
+      const content = `**Witness Video**\nStory: ${storyTitle || storyId}\nOriginal: s3://${S3_BUCKET}/${originalKey}\nPreview: s3://${S3_BUCKET}/${previewKey}`;
+      try {
+        await fetch(DISCORD_WEBHOOK_URL, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ content }),
+        });
+      } catch (e) {
+        console.warn("Discord webhook failed:", e?.message || e);
+      }
+    }
+
+    // 4) Respond
+    return res.json({
+      ok: true,
+      id: baseName,
+      original: { bucket: S3_BUCKET, key: originalKey },
+      preview: { bucket: S3_BUCKET, key: previewKey },
+      message: "Uploaded (original + watermarked preview). View videos in Discord.",
+    });
+
+  } catch (e) {
+    console.error("witness upload failed:", e);
+    return res.status(500).json({ error: "Upload failed", detail: String(e?.message || e) });
+  }
+});
+
+module.exports = router;

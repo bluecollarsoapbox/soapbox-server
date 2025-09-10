@@ -13,6 +13,7 @@ app.set('trust proxy', 1);
 app.use(cors());
 app.use(express.json({ limit: '2mb' }));
 app.use(express.urlencoded({ extended: true, limit: '2mb' }));
+app.use("/api", require("./routes/witness-s3"));
 
 // ---------- Paths / dirs ----------
 const ROOT = __dirname;
