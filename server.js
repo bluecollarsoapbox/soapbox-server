@@ -1,10 +1,9 @@
-// server.js — Blue Collar Soapbox API (INLINE S3 witness route)
+// server.js — Blue Collar Soapbox API (INLINE S3 witness route + bot)
 
-// Core
+// ---------- Env & Core ----------
+require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
-
-// S3 upload deps (inline route)
 const multer = require('multer');
 const path = require('path');
 const crypto = require('crypto');
@@ -19,13 +18,15 @@ app.use(cors());
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
-// ---------- Inline S3 Witness Upload Route ----------
+// ---------- Config ----------
 const SOAPBOX_KEY = process.env.SOAPBOX_API_KEY || process.env.API_KEY || '';
 const S3_BUCKET   = process.env.S3_BUCKET;                  // e.g. soapbox-app-data
-const S3_REGION   = process.env.AWS_REGION || 'us-east-2';  // you chose us-east-2
+const S3_REGION   = process.env.AWS_REGION || 'us-east-2';  // your chosen region
 
-const s3 = new S3Client({ region: S3_REGION }); // expects AWS_ACCESS_KEY_ID/SECRET in env
+// AWS creds are read from env: AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY
+const s3 = new S3Client({ region: S3_REGION });
 
+// ---------- Helpers ----------
 const sanitize = (s) =>
   String(s || '').replace(/[^\w\-\s.]/g, '').replace(/\s+/g, ' ').trim().slice(0, 80);
 
@@ -37,14 +38,17 @@ const pickExt = (original, mimetype) => {
   return '.mp4';
 };
 
+// Multer (memory)
 const uploadMem = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: 200 * 1024 * 1024 }, // 200MB
+  limits: { fileSize: 200 * 1024 * 1024 }, // 200 MB
 });
 
-// quick probe
-app.get('/api/witness/test', (_req, res) => {
-  res.json({ ok: true, route: '/api/witness/test' });
+// ---------- Inline S3 Witness Routes ----------
+app.get('/api/witness/ping', (req, res) => {
+  const k = req.header('x-soapbox-key') || '';
+  if (!SOAPBOX_KEY || k !== SOAPBOX_KEY) return res.status(401).json({ error: 'Unauthorized' });
+  res.json({ ok: true });
 });
 
 app.post('/api/witness', uploadMem.single('video'), async (req, res) => {
@@ -63,39 +67,46 @@ app.post('/api/witness', uploadMem.single('video'), async (req, res) => {
     const cleanTitle = sanitize(storyTitle) || cleanId;
 
     const ext   = pickExt(req.file.originalname, req.file.mimetype);
-    const stamp = new Date().toISOString().replace(/[:.]/g, '').replace('T','_').slice(0,15);
+    const stamp = new Date().toISOString().replace(/[:.]/g, '').replace('T', '_').slice(0, 15);
     const rand  = crypto.randomBytes(3).toString('hex');
 
-    // S3 key layout
     const key = `stories/${cleanId}/witnesses/${stamp}_${rand}_${cleanTitle}${ext}`;
 
-    await s3.send(new PutObjectCommand({
-      Bucket: S3_BUCKET,
-      Key: key,
-      Body: req.file.buffer,
-      ContentType: req.file.mimetype || 'application/octet-stream',
-      // ACL defaults to private
-    }));
+    await s3.send(
+      new PutObjectCommand({
+        Bucket: S3_BUCKET,
+        Key: key,
+        Body: req.file.buffer,
+        ContentType: req.file.mimetype || 'application/octet-stream',
+      })
+    );
 
     res.json({ ok: true, bucket: S3_BUCKET, key, size: req.file.size, contentType: req.file.mimetype || null });
   } catch (e) {
-    console.error('[inline witness] upload error:', e);
+    console.error('[witness] upload error:', e);
     res.status(500).json({ error: 'Upload failed' });
   }
 });
 
-// ---------- Health ----------
+// ---------- Health & Errors ----------
 app.get('/health', (_req, res) => res.json({ ok: true }));
 
-// ---------- 404 & Error ----------
 app.use((_req, res) => res.status(404).json({ error: 'Not found' }));
 app.use((err, _req, res, _next) => {
   console.error('API error:', err);
   res.status(err.status || 500).json({ error: err.message || 'Server error' });
 });
 
-// ---------- Start ----------
+// ---------- Start Express ----------
 const PORT = Number(process.env.PORT) || 3030;
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`API listening on :${PORT}`);
 });
+
+// ---------- Start Discord bot ----------
+try {
+  require('./bot');
+  console.log('✅ Discord bot started');
+} catch (e) {
+  console.error('❌ Bot start failed:', e);
+}
