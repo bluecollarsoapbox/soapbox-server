@@ -44,18 +44,25 @@ const uploadMem = multer({
   limits: { fileSize: 200 * 1024 * 1024 }, // 200 MB
 });
 
-// ---------- Inline S3 Witness Routes ----------
-app.get('/api/witness/ping', (req, res) => {
+// ---------- Auth helper ----------
+function requireKey(req, res) {
   const k = req.header('x-soapbox-key') || '';
-  if (!SOAPBOX_KEY || k !== SOAPBOX_KEY) return res.status(401).json({ error: 'Unauthorized' });
+  if (!SOAPBOX_KEY || k !== SOAPBOX_KEY) {
+    res.status(401).json({ error: 'Unauthorized' });
+    return false;
+  }
+  return true;
+}
+
+// ---------- Witness handlers (S3) ----------
+app.get(['/witness/ping', '/api/witness/ping'], (req, res) => {
+  if (!requireKey(req, res)) return;
   res.json({ ok: true });
 });
 
-app.post('/api/witness', uploadMem.single('video'), async (req, res) => {
+async function handleWitnessPost(req, res) {
   try {
-    // auth
-    const k = req.header('x-soapbox-key') || '';
-    if (!SOAPBOX_KEY || k !== SOAPBOX_KEY) return res.status(401).json({ error: 'Unauthorized' });
+    if (!requireKey(req, res)) return;
 
     if (!S3_BUCKET) return res.status(500).json({ error: 'S3 bucket not configured' });
     if (!req.file)   return res.status(400).json({ error: 'video file required (field "video")' });
@@ -63,30 +70,38 @@ app.post('/api/witness', uploadMem.single('video'), async (req, res) => {
     const { storyId, storyTitle } = req.body || {};
     if (!storyId) return res.status(400).json({ error: 'storyId required' });
 
-    const cleanId    = sanitize(storyId);
-    const cleanTitle = sanitize(storyTitle) || cleanId;
+    const cleanId    = sanitize(storyId);                 // e.g. Story1
+    const cleanTitle = sanitize(storyTitle) || cleanId;   // e.g. Crawl Space vs. Concrete
 
     const ext   = pickExt(req.file.originalname, req.file.mimetype);
     const stamp = new Date().toISOString().replace(/[:.]/g, '').replace('T', '_').slice(0, 15);
     const rand  = crypto.randomBytes(3).toString('hex');
 
+    // S3 layout you wanted
     const key = `stories/${cleanId}/witnesses/${stamp}_${rand}_${cleanTitle}${ext}`;
 
-    await s3.send(
-      new PutObjectCommand({
-        Bucket: S3_BUCKET,
-        Key: key,
-        Body: req.file.buffer,
-        ContentType: req.file.mimetype || 'application/octet-stream',
-      })
-    );
+    await s3.send(new PutObjectCommand({
+      Bucket: S3_BUCKET,
+      Key: key,
+      Body: req.file.buffer,
+      ContentType: req.file.mimetype || 'application/octet-stream',
+    }));
 
-    res.json({ ok: true, bucket: S3_BUCKET, key, size: req.file.size, contentType: req.file.mimetype || null });
+    res.json({
+      ok: true,
+      bucket: S3_BUCKET,
+      key,
+      size: req.file.size,
+      contentType: req.file.mimetype || null,
+    });
   } catch (e) {
-    console.error('[witness] upload error:', e);
+    console.error('[witness->s3] upload error:', e);
     res.status(500).json({ error: 'Upload failed' });
   }
-});
+}
+
+app.post('/witness', uploadMem.single('video'), handleWitnessPost);
+app.post('/api/witness', uploadMem.single('video'), handleWitnessPost);
 
 // ---------- Health & Errors ----------
 app.get('/health', (_req, res) => res.json({ ok: true }));
