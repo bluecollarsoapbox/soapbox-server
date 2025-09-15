@@ -1,4 +1,4 @@
-// server.js — Blue Collar Soapbox API (INLINE S3 witness route + bot)
+// server.js — Blue Collar Soapbox API (S3 witness upload + instant Discord post + bot)
 
 // ---------- Env & Core ----------
 require('dotenv').config();
@@ -8,6 +8,7 @@ const multer = require('multer');
 const path = require('path');
 const crypto = require('crypto');
 const { S3Client, PutObjectCommand } = require('@aws-sdk/client-s3');
+const { postWitnessToDiscord } = require('./discordPoster'); // <- NEW
 
 const app = express();
 
@@ -54,7 +55,7 @@ function requireKey(req, res) {
   return true;
 }
 
-// ---------- Witness handlers (S3) ----------
+// ---------- Witness handlers (S3 + Discord) ----------
 app.get(['/witness/ping', '/api/witness/ping'], (req, res) => {
   if (!requireKey(req, res)) return;
   res.json({ ok: true });
@@ -77,9 +78,10 @@ async function handleWitnessPost(req, res) {
     const stamp = new Date().toISOString().replace(/[:.]/g, '').replace('T', '_').slice(0, 15);
     const rand  = crypto.randomBytes(3).toString('hex');
 
-    // S3 layout you wanted
+    // S3 layout
     const key = `stories/${cleanId}/witnesses/${stamp}_${rand}_${cleanTitle}${ext}`;
 
+    // 1) Put to S3
     await s3.send(new PutObjectCommand({
       Bucket: S3_BUCKET,
       Key: key,
@@ -87,12 +89,27 @@ async function handleWitnessPost(req, res) {
       ContentType: req.file.mimetype || 'application/octet-stream',
     }));
 
+    // 2) Post to Discord immediately (video upload, not a link)
+    let posted = false;
+    try {
+      posted = await postWitnessToDiscord({
+        storyId: cleanId,
+        storyTitle: cleanTitle,
+        buffer: req.file.buffer,
+        filename: `${cleanTitle}${ext}`.replace(/\s+/g, '_'),
+        mime: req.file.mimetype || 'application/octet-stream',
+      });
+    } catch (e) {
+      console.error('[discord post] failed:', e);
+    }
+
     res.json({
       ok: true,
       bucket: S3_BUCKET,
       key,
       size: req.file.size,
       contentType: req.file.mimetype || null,
+      discordPosted: !!posted,
     });
   } catch (e) {
     console.error('[witness->s3] upload error:', e);
@@ -100,7 +117,7 @@ async function handleWitnessPost(req, res) {
   }
 }
 
-app.post('/witness', uploadMem.single('video'), handleWitnessPost);
+app.post('/witness',     uploadMem.single('video'), handleWitnessPost);
 app.post('/api/witness', uploadMem.single('video'), handleWitnessPost);
 
 // ---------- Health & Errors ----------
@@ -118,9 +135,9 @@ app.listen(PORT, '0.0.0.0', () => {
   console.log(`API listening on :${PORT}`);
 });
 
-// ---------- Start Discord bot ----------
+// ---------- Start Discord bot (kept exactly how you had it) ----------
 try {
-  require('./bot');
+  require('./bot'); // TIP: add `global.soapboxClient = client` inside bot.js after login (one line; see below)
   console.log('✅ Discord bot started');
 } catch (e) {
   console.error('❌ Bot start failed:', e);
