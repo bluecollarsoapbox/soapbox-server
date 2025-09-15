@@ -1,30 +1,25 @@
-// server.js — Blue Collar Soapbox API (S3 witness upload + instant Discord post + bot)
+// server.js — Blue Collar Soapbox API (stories + witness + bot)
 
-// ---------- Env & Core ----------
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
-const multer = require('multer');
+const fs = require('fs/promises');
 const path = require('path');
 const crypto = require('crypto');
+const multer = require('multer');
 const { S3Client, PutObjectCommand } = require('@aws-sdk/client-s3');
-const { postWitnessToDiscord } = require('./discordPoster'); // <- NEW
 
 const app = express();
-
-// ---------- Middleware ----------
 app.disable('x-powered-by');
-app.set('trust proxy', 1);
 app.use(cors());
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
 // ---------- Config ----------
+const DATA_DIR = path.join(__dirname, 'Stories');
 const SOAPBOX_KEY = process.env.SOAPBOX_API_KEY || process.env.API_KEY || '';
-const S3_BUCKET   = process.env.S3_BUCKET;                  // e.g. soapbox-app-data
-const S3_REGION   = process.env.AWS_REGION || 'us-east-2';  // your chosen region
-
-// AWS creds are read from env: AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY
+const S3_BUCKET = process.env.S3_BUCKET;
+const S3_REGION = process.env.AWS_REGION || 'us-east-2';
 const s3 = new S3Client({ region: S3_REGION });
 
 // ---------- Helpers ----------
@@ -39,13 +34,8 @@ const pickExt = (original, mimetype) => {
   return '.mp4';
 };
 
-// Multer (memory)
-const uploadMem = multer({
-  storage: multer.memoryStorage(),
-  limits: { fileSize: 200 * 1024 * 1024 }, // 200 MB
-});
+const uploadMem = multer({ storage: multer.memoryStorage(), limits: { fileSize: 200 * 1024 * 1024 } });
 
-// ---------- Auth helper ----------
 function requireKey(req, res) {
   const k = req.header('x-soapbox-key') || '';
   if (!SOAPBOX_KEY || k !== SOAPBOX_KEY) {
@@ -55,33 +45,86 @@ function requireKey(req, res) {
   return true;
 }
 
-// ---------- Witness handlers (S3 + Discord) ----------
+// ---------- Story Reading ----------
+async function readStoryPresentation(storyDir, storyId) {
+  const headline = await safeRead(path.join(storyDir, 'headline.txt'));
+  const subtitle = await safeRead(path.join(storyDir, 'subtitle.txt'));
+  const thumb = await safeFindThumb(storyDir);
+
+  // If metadata.json exists, merge it
+  let meta = {};
+  try {
+    const raw = await fs.readFile(path.join(storyDir, 'metadata.json'), 'utf8');
+    meta = JSON.parse(raw);
+  } catch {}
+
+  return {
+    id: storyId,
+    headline: headline || meta.headline || storyId,
+    subtitle: subtitle || meta.subtitle || '',
+    thumbUrl: thumb || meta.thumbnail || '',
+  };
+}
+
+async function safeRead(p) {
+  try {
+    return (await fs.readFile(p, 'utf8')).trim();
+  } catch {
+    return '';
+  }
+}
+
+async function safeFindThumb(storyDir) {
+  const candidates = ['thumbYT.jpg', 'thumbYT.png', 'thumb.jpg', 'thumb.png'];
+  for (const f of candidates) {
+    try {
+      await fs.access(path.join(storyDir, f));
+      return `/static/${path.basename(storyDir)}/${f}`;
+    } catch {}
+  }
+  return '';
+}
+
+// ---------- Routes ----------
+app.get('/stories', async (_req, res) => {
+  try {
+    const dirs = await fs.readdir(DATA_DIR, { withFileTypes: true });
+    const stories = [];
+    for (const d of dirs) {
+      if (!d.isDirectory()) continue;
+      const storyId = d.name;
+      const storyDir = path.join(DATA_DIR, storyId);
+      stories.push(await readStoryPresentation(storyDir, storyId));
+    }
+    res.json(stories);
+  } catch (e) {
+    console.error('Error reading stories:', e);
+    res.status(500).json({ error: 'Failed to read stories' });
+  }
+});
+
 app.get(['/witness/ping', '/api/witness/ping'], (req, res) => {
   if (!requireKey(req, res)) return;
   res.json({ ok: true });
 });
 
-async function handleWitnessPost(req, res) {
+app.post(['/witness', '/api/witness'], uploadMem.single('video'), async (req, res) => {
   try {
     if (!requireKey(req, res)) return;
-
     if (!S3_BUCKET) return res.status(500).json({ error: 'S3 bucket not configured' });
-    if (!req.file)   return res.status(400).json({ error: 'video file required (field "video")' });
+    if (!req.file) return res.status(400).json({ error: 'video file required' });
 
     const { storyId, storyTitle } = req.body || {};
     if (!storyId) return res.status(400).json({ error: 'storyId required' });
 
-    const cleanId    = sanitize(storyId);                 // e.g. Story1
-    const cleanTitle = sanitize(storyTitle) || cleanId;   // e.g. Crawl Space vs. Concrete
-
-    const ext   = pickExt(req.file.originalname, req.file.mimetype);
+    const cleanId = sanitize(storyId);
+    const cleanTitle = sanitize(storyTitle) || cleanId;
+    const ext = pickExt(req.file.originalname, req.file.mimetype);
     const stamp = new Date().toISOString().replace(/[:.]/g, '').replace('T', '_').slice(0, 15);
-    const rand  = crypto.randomBytes(3).toString('hex');
+    const rand = crypto.randomBytes(3).toString('hex');
 
-    // S3 layout
     const key = `stories/${cleanId}/witnesses/${stamp}_${rand}_${cleanTitle}${ext}`;
 
-    // 1) Put to S3
     await s3.send(new PutObjectCommand({
       Bucket: S3_BUCKET,
       Key: key,
@@ -89,38 +132,14 @@ async function handleWitnessPost(req, res) {
       ContentType: req.file.mimetype || 'application/octet-stream',
     }));
 
-    // 2) Post to Discord immediately (video upload, not a link)
-    let posted = false;
-    try {
-      posted = await postWitnessToDiscord({
-        storyId: cleanId,
-        storyTitle: cleanTitle,
-        buffer: req.file.buffer,
-        filename: `${cleanTitle}${ext}`.replace(/\s+/g, '_'),
-        mime: req.file.mimetype || 'application/octet-stream',
-      });
-    } catch (e) {
-      console.error('[discord post] failed:', e);
-    }
-
-    res.json({
-      ok: true,
-      bucket: S3_BUCKET,
-      key,
-      size: req.file.size,
-      contentType: req.file.mimetype || null,
-      discordPosted: !!posted,
-    });
+    res.json({ ok: true, bucket: S3_BUCKET, key, size: req.file.size });
   } catch (e) {
     console.error('[witness->s3] upload error:', e);
     res.status(500).json({ error: 'Upload failed' });
   }
-}
+});
 
-app.post('/witness',     uploadMem.single('video'), handleWitnessPost);
-app.post('/api/witness', uploadMem.single('video'), handleWitnessPost);
-
-// ---------- Health & Errors ----------
+// ---------- Health ----------
 app.get('/health', (_req, res) => res.json({ ok: true }));
 
 app.use((_req, res) => res.status(404).json({ error: 'Not found' }));
@@ -129,15 +148,14 @@ app.use((err, _req, res, _next) => {
   res.status(err.status || 500).json({ error: err.message || 'Server error' });
 });
 
-// ---------- Start Express ----------
+// ---------- Start ----------
 const PORT = Number(process.env.PORT) || 3030;
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`API listening on :${PORT}`);
 });
 
-// ---------- Start Discord bot (kept exactly how you had it) ----------
 try {
-  require('./bot'); // TIP: add `global.soapboxClient = client` inside bot.js after login (one line; see below)
+  require('./bot');
   console.log('✅ Discord bot started');
 } catch (e) {
   console.error('❌ Bot start failed:', e);
