@@ -84,6 +84,39 @@ app.post("/confessions", async (req, res) => {
   const { text } = req.body || {};
   if (!text) return res.status(400).json({ error: "Confession text required" });
 
+// --- ADMIN: LINKS & SPOTLIGHTS (REPLACE-WHOLE-FILE) ---
+
+// Replace the entire links.json with the body you send (must be an array)
+app.post("/admin/links", requireAdmin, (req, res) => {
+  try {
+    const file = path.join(DATA_ROOT, "app/links.json");
+    if (!Array.isArray(req.body)) {
+      return res.status(400).json({ error: "Body must be an array of {label, url}" });
+    }
+    ensureDir(path.dirname(file));
+    fs.writeFileSync(file, JSON.stringify(req.body, null, 2));
+    res.json({ ok: true, count: req.body.length });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Replace the entire spotlights.json with the body you send (must be an array)
+app.post("/admin/spotlights", requireAdmin, (req, res) => {
+  try {
+    const file = path.join(DATA_ROOT, "app/spotlights.json");
+    if (!Array.isArray(req.body)) {
+      return res.status(400).json({ error: "Body must be an array of items" });
+    }
+    ensureDir(path.dirname(file));
+    fs.writeFileSync(file, JSON.stringify(req.body, null, 2));
+    res.json({ ok: true, count: req.body.length });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+
   try {
     // Save to disk
     const file = path.join(DATA_ROOT, "app/confessions.json");
