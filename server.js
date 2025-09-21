@@ -1,5 +1,6 @@
 // SOAPBOX SERVER — Render disk + full admin + Discord posting
 // Source of truth on Render disk: /opt/render/project/data
+// Restores legacy behavior: use metadata.voicemail as the exact filename for app autoplay & uploads.
 
 const express = require("express");
 const cors = require("cors");
@@ -9,7 +10,6 @@ const path = require("path");
 const archiver = require("archiver");
 const { Client, GatewayIntentBits, AttachmentBuilder } = require("discord.js");
 
-// If you have these helpers, great; if not, the server falls back to internal logic
 let externalPoster = null;
 try { externalPoster = require("./discordPoster"); } catch (_) {}
 
@@ -22,7 +22,7 @@ const ADMIN_KEY = process.env.SOAPBOX_API_KEY || "changeme";
 const DISCORD_TOKEN = process.env.DISCORD_TOKEN || "";
 const CONFESSIONS_CHANNEL_ID = process.env.CONFESSIONS_CHANNEL_ID || "";
 const SPOTLIGHT_CHANNEL_ID   = process.env.SPOTLIGHT_CHANNEL_ID   || "";
-const VOICEMAIL_CHANNEL_ID   = process.env.VOICEMAIL_CHANNEL_ID   || ""; // fallback when no per-story thread
+const VOICEMAIL_CHANNEL_ID   = process.env.VOICEMAIL_CHANNEL_ID   || ""; // fallback when poster not available
 
 // ---------- DISCORD ----------
 const discordClient = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages] });
@@ -39,7 +39,7 @@ const app = express();
 app.use(cors());
 app.use(express.json({ limit: "25mb" }));
 
-// Serve the entire Render disk (supports range for media)
+// Serve the entire Render disk
 app.use("/static", express.static(DATA_ROOT, {
   fallthrough: true,
   setHeaders(res) { res.setHeader("Access-Control-Allow-Origin", "*"); }
@@ -64,31 +64,26 @@ function requireAdmin(req, res, next) {
 }
 function storyDirOf(id) { return path.join(DATA_ROOT, "Stories", id); }
 function urlFor(absPath) { return "/static" + absPath.replace(DATA_ROOT, "").replace(/\\/g, "/"); }
-function latestByMtime(dir, exts) {
-  try {
-    if (!fs.existsSync(dir)) return null;
-    const files = fs.readdirSync(dir)
-      .filter(n => exts.some(e => n.toLowerCase().endsWith(e)))
-      .map(n => ({ n, p: path.join(dir, n), m: fs.statSync(path.join(dir, n)).mtimeMs }))
-      .sort((a, b) => b.m - a.m);
-    return files[0] || null;
-  } catch { return null; }
+
+function readStoryMeta(id) {
+  return safeReadJson(path.join(DATA_ROOT, "Stories", id, "metadata.json"), { id });
 }
-function threadsMap() {
-  // Optional mapping file: /data/app/threads.json  -> { "Story1": "123456789012345678", ... }
-  return safeReadJson(path.join(DATA_ROOT, "app", "threads.json"), {});
+function voicemailFilenameFromMeta(meta) {
+  if (meta && typeof meta.voicemail === "string" && meta.voicemail.trim()) return meta.voicemail.trim();
+  return "voicemail.mp3"; // fallback if not set
 }
+function absStoryPath(id, rel) { return path.join(DATA_ROOT, "Stories", id, rel); }
+
 async function postFileToDiscord(storyId, absFilePath, content = "") {
-  // Prefer external helper if present
+  // Use your existing poster if available (preserves thread routing)
   if (externalPoster && typeof externalPoster === "function") {
-    return externalPoster(discordClient, storyId, absFilePath, content);
+    try { return await externalPoster(discordClient, storyId, absFilePath, content); }
+    catch (e) { console.warn("[DiscordPoster] external poster failed, falling back:", e.message); }
   }
-  // Internal: try per-story thread, else fallback channel
-  const map = threadsMap();
-  const targetId = map[storyId] || VOICEMAIL_CHANNEL_ID || SPOTLIGHT_CHANNEL_ID || CONFESSIONS_CHANNEL_ID;
-  if (!targetId) throw new Error("No Discord target (threads.json or VOICEMAIL_CHANNEL_ID)");
-  const ch = await discordClient.channels.fetch(targetId);
-  if (!ch) throw new Error("Discord channel/thread not found");
+  // Fallback: simple channel post to VOICEMAIL_CHANNEL_ID (if set)
+  if (!VOICEMAIL_CHANNEL_ID) throw new Error("No VOICEMAIL_CHANNEL_ID set and external poster unavailable.");
+  const ch = await discordClient.channels.fetch(VOICEMAIL_CHANNEL_ID);
+  if (!ch) throw new Error("Discord channel not found");
   const file = new AttachmentBuilder(absFilePath);
   return ch.send({ content, files: [file] });
 }
@@ -99,6 +94,7 @@ app.get("/static/:storyId/metadata.json", (req, res) => {
   if (!fs.existsSync(file)) return res.status(404).json({ error: "Not found" });
   res.type("application/json").send(fs.readFileSync(file, "utf8"));
 });
+
 // Alias /static/:id/*  →  /Stories/:id/*
 app.get("/static/:storyId/*", (req, res, next) => {
   const file = path.join(storyDirOf(req.params.storyId), req.params[0] || "");
@@ -121,12 +117,8 @@ app.post("/admin/links", requireAdmin, (req, res) => {
 app.post("/admin/spotlights", requireAdmin, async (req, res) => {
   if (!Array.isArray(req.body)) return res.status(400).json({ error: "Body must be an array" });
   writeJson(path.join(DATA_ROOT, "app/spotlights.json"), req.body);
-  // optional notify
   if (SPOTLIGHT_CHANNEL_ID) {
-    try {
-      const ch = await discordClient.channels.fetch(SPOTLIGHT_CHANNEL_ID);
-      if (ch) await ch.send("✅ Spotlights updated");
-    } catch {}
+    try { const ch = await discordClient.channels.fetch(SPOTLIGHT_CHANNEL_ID); if (ch) await ch.send("✅ Spotlights updated"); } catch {}
   }
   res.json({ ok: true, count: req.body.length });
 });
@@ -141,12 +133,8 @@ app.post("/confessions", async (req, res) => {
   const arr = safeReadJson(file, []);
   arr.push({ text, at: new Date().toISOString() });
   writeJson(file, arr);
-  // post to Discord channel if configured
   if (CONFESSIONS_CHANNEL_ID) {
-    try {
-      const ch = await discordClient.channels.fetch(CONFESSIONS_CHANNEL_ID);
-      if (ch) await ch.send(text);
-    } catch (e) { console.warn("[Discord] Confession post failed:", e.message); }
+    try { const ch = await discordClient.channels.fetch(CONFESSIONS_CHANNEL_ID); if (ch) await ch.send(text); } catch {}
   }
   res.json({ ok: true });
 });
@@ -164,8 +152,11 @@ app.get("/stories", (_req, res) => {
         const meta = safeReadJson(metaFile, {});
         const thumbRel = meta.thumbnailYt || meta.youtubeThumbnail || meta.thumbnail || null;
         const thumbUrl = thumbRel ? `/static/Stories/${id}/${thumbRel}` : null;
-        const voicemailMp3 = path.join(dir, "voicemail.mp3");
-        const voicemailUrl = fs.existsSync(voicemailMp3) ? urlFor(voicemailMp3) : null;
+
+        const vmFile = voicemailFilenameFromMeta(meta);
+        const vmAbs  = path.join(dir, vmFile);
+        const voicemailUrl = fs.existsSync(vmAbs) ? urlFor(vmAbs) : null;
+
         out.push({
           id,
           title: meta.title || id,
@@ -185,9 +176,11 @@ app.get("/stories", (_req, res) => {
 
 // ---------- VOICEMAIL (APP AUTOPLAY) ----------
 app.get("/voicemail/:id", (req, res) => {
-  const mp3 = path.join(storyDirOf(req.params.id), "voicemail.mp3");
-  if (!fs.existsSync(mp3)) return res.status(404).json({ error: "No voicemail for this story" });
-  res.redirect(302, urlFor(mp3));
+  const meta = readStoryMeta(req.params.id);
+  const vmFile = voicemailFilenameFromMeta(meta);
+  const abs = absStoryPath(req.params.id, vmFile);
+  if (!fs.existsSync(abs)) return res.status(404).json({ error: "No voicemail for this story" });
+  res.redirect(302, urlFor(abs));
 });
 
 // ---------- ADMIN: STORY META / THUMB / THUMB-YT ----------
@@ -201,8 +194,8 @@ app.post("/admin/story/:id/meta", requireAdmin, (req, res) => {
     if (typeof req.body.title === "string") next.title = req.body.title;
     if (typeof req.body.subtitle === "string") next.subtitle = req.body.subtitle;
     if (Array.isArray(req.body.prompts)) next.prompts = req.body.prompts;
+    if (typeof req.body.voicemail === "string") next.voicemail = req.body.voicemail; // legacy: allow setting filename
 
-    // handle 'active' toggle: set this one active, others false
     if (typeof req.body.active === "boolean" && req.body.active) {
       const root = path.join(DATA_ROOT, "Stories");
       if (fs.existsSync(root)) {
@@ -269,21 +262,20 @@ app.post("/admin/story/:id/voicemail", requireAdmin, upload.single("audio"), asy
     if (!req.file) return res.status(400).json({ error: "Missing audio" });
 
     const dir = storyDirOf(storyId); ensureDir(dir);
-
-    const mp3Path = path.join(dir, "voicemail.mp3");
-    const mp4Path = path.join(dir, "voicemail.mp4");
+    const meta = readStoryMeta(storyId);
+    const vmFile = voicemailFilenameFromMeta(meta);          // EXACT filename from metadata (legacy)
+    const mp3Path = absStoryPath(storyId, vmFile);
+    const mp4Path = absStoryPath(storyId, vmFile.replace(/\.[^.]+$/, "") + ".mp4");
 
     try { fs.unlinkSync(mp3Path); } catch {}
     fs.renameSync(req.file.path, mp3Path);
 
-    const meta = safeReadJson(path.join(dir, "metadata.json"), {});
     const ytThumb = meta.thumbnailYt || meta.youtubeThumbnail
-      ? path.join(dir, meta.thumbnailYt || meta.youtubeThumbnail)
+      ? absStoryPath(storyId, meta.thumbnailYt || meta.youtubeThumbnail)
       : null;
 
     await makeVoicemailVideo(mp3Path, mp4Path, ytThumb || undefined);
 
-    // post to correct Discord thread (from /data/app/threads.json)
     await postFileToDiscord(storyId, mp4Path, `📣 Voicemail for **${storyId}**`);
 
     res.json({ ok: true, mp3: urlFor(mp3Path), mp4: urlFor(mp4Path) });
@@ -349,8 +341,6 @@ app.post("/admin/rotate-stories", requireAdmin, (req, res) => {
 });
 
 // ---------- ADMIN: EXPORT (ZIP originals) ----------
-// GET /admin/export            -> all stories
-// GET /admin/export?story=ID   -> one story
 app.get("/admin/export", requireAdmin, (req, res) => {
   try {
     const story = (req.query.story || "").trim();
@@ -373,7 +363,6 @@ app.get("/admin/export", requireAdmin, (req, res) => {
       const metaFile = path.join(dir, "metadata.json");
       if (!fs.existsSync(metaFile)) return;
 
-      // include metadata, thumbnails, voicemail.mp3, witnesses/**
       archive.file(metaFile, { name: `${id}/metadata.json` });
 
       const meta = safeReadJson(metaFile, {});
@@ -383,22 +372,18 @@ app.get("/admin/export", requireAdmin, (req, res) => {
         .filter(p => fs.existsSync(p));
       thumbs.forEach((p, i) => archive.file(p, { name: `${id}/thumb-${i+1}${path.extname(p)}` }));
 
-      const vmp3 = path.join(dir, "voicemail.mp3");
-      if (fs.existsSync(vmp3)) archive.file(vmp3, { name: `${id}/voicemail.mp3` });
+      const vmFile = voicemailFilenameFromMeta(meta);
+      const vmp3 = path.join(dir, vmFile);
+      if (fs.existsSync(vmp3)) archive.file(vmp3, { name: `${id}/${vmFile}` });
 
-      const vmp4 = path.join(dir, "voicemail.mp4");
-      if (fs.existsSync(vmp4)) archive.file(vmp4, { name: `${id}/voicemail.mp4` });
+      const vmp4 = path.join(dir, vmFile.replace(/\.[^.]+$/, "") + ".mp4");
+      if (fs.existsSync(vmp4)) archive.file(vmp4, { name: `${id}/${path.basename(vmp4)}` });
 
       const witDir = path.join(dir, "witnesses");
       if (fs.existsSync(witDir)) archive.directory(witDir, `${id}/witnesses`);
     };
 
-    if (story) {
-      addStory(story);
-    } else {
-      for (const id of fs.readdirSync(root)) addStory(id);
-    }
-
+    if (story) addStory(story); else for (const id of fs.readdirSync(root)) addStory(id);
     archive.finalize();
   } catch (err) {
     console.error(err);
@@ -406,7 +391,7 @@ app.get("/admin/export", requireAdmin, (req, res) => {
   }
 });
 
-// ---------- NEW: DISCORD VOICEMAIL INBOX (global channel post) ----------
+// ---------- OPTIONAL: DISCORD VOICEMAIL INBOX (global channel post) ----------
 app.post("/admin/discord/voicemail", requireAdmin, upload.single("audio"), async (req, res) => {
   try {
     if (!VOICEMAIL_CHANNEL_ID) return res.status(400).json({ error: "VOICEMAIL_CHANNEL_ID not set" });

@@ -1,4 +1,6 @@
+// makeVoicemailVideo.js — uses the bundled ffmpeg-static binary
 const { spawn } = require("child_process");
+const ffmpegPath = require("ffmpeg-static"); // <- no system install needed
 
 function run(cmd, args) {
   return new Promise((resolve, reject) => {
@@ -9,8 +11,6 @@ function run(cmd, args) {
 }
 
 async function makeVoicemailVideo(mp3Path, mp4Out, imagePath) {
-  const ffmpeg = process.env.FFMPEG_PATH || "ffmpeg";
-
   const hasImage = !!imagePath;
   const vf = hasImage
     ? [
@@ -40,7 +40,7 @@ async function makeVoicemailVideo(mp3Path, mp4Out, imagePath) {
     mp4Out
   ];
 
-  await run(ffmpeg, args);
+  await run(ffmpegPath, args);
 }
 
 module.exports = makeVoicemailVideo;
