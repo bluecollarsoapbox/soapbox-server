@@ -95,13 +95,16 @@ app.get("/static/:storyId/metadata.json", (req, res) => {
   res.type("application/json").send(fs.readFileSync(file, "utf8"));
 });
 
-// Alias /static/:id/*  →  /Stories/:id/*
-app.get("/static/:storyId/:rest*", (req, res, next) => {
-  const rest = req.params.rest || "";
-  const file = path.join(storyDirOf(req.params.storyId), rest);
-  if (!fs.existsSync(file) || fs.statSync(file).isDirectory()) return next();
-  res.sendFile(file);
-});
+// Directly serve /static/Stories/* from the Stories folder (no wildcards in the route)
+app.use(
+  "/static/Stories",
+  express.static(path.join(DATA_ROOT, "Stories"), {
+    fallthrough: true,
+    setHeaders(res) { res.setHeader("Access-Control-Allow-Origin", "*"); }
+  })
+);
+
+
 
 // ---------- HEALTH ----------
 app.get("/health", (_req, res) => res.json({ ok: true, time: new Date().toISOString() }));
