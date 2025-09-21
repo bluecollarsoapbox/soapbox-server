@@ -1,181 +1,157 @@
-// server.js — disk-based SOAPBOX server (Render /data)
-// Drop-in replacement: adds /voicemail/:id + static aliases the app expects.
+// SOAPBOX SERVER — Render disk + full admin + Discord posting
+// Source of truth on Render disk: /opt/render/project/data
 
 const express = require("express");
 const cors = require("cors");
 const multer = require("multer");
 const fs = require("fs");
 const path = require("path");
-const { Client, GatewayIntentBits } = require("discord.js");
+const archiver = require("archiver");
+const { Client, GatewayIntentBits, AttachmentBuilder } = require("discord.js");
 
-const makeVoicemailVideo = require("./makeVoicemailVideo"); // mp3->mp4 for Discord inline
-const postToDiscord = require("./discordPoster"); // posts files to the right Discord thread
+// If you have these helpers, great; if not, the server falls back to internal logic
+let externalPoster = null;
+try { externalPoster = require("./discordPoster"); } catch (_) {}
 
-// ----- CONFIG -----
-const DATA_ROOT =
-  process.env.DATA_DIR ||
-  process.env.DATA_ROOT ||
-  "/opt/render/project/data";
+const makeVoicemailVideo = require("./makeVoicemailVideo");
 
+// ---------- CONFIG ----------
+const DATA_ROOT = process.env.DATA_DIR || process.env.DATA_ROOT || "/opt/render/project/data";
 const ADMIN_KEY = process.env.SOAPBOX_API_KEY || "changeme";
+
 const DISCORD_TOKEN = process.env.DISCORD_TOKEN || "";
 const CONFESSIONS_CHANNEL_ID = process.env.CONFESSIONS_CHANNEL_ID || "";
-const SPOTLIGHT_CHANNEL_ID = process.env.SPOTLIGHT_CHANNEL_ID || "";
+const SPOTLIGHT_CHANNEL_ID   = process.env.SPOTLIGHT_CHANNEL_ID   || "";
+const VOICEMAIL_CHANNEL_ID   = process.env.VOICEMAIL_CHANNEL_ID   || ""; // fallback when no per-story thread
 
-// ----- DISCORD -----
-const discordClient = new Client({
-  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages],
-});
+// ---------- DISCORD ----------
+const discordClient = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages] });
 if (DISCORD_TOKEN) {
-  discordClient
-    .login(DISCORD_TOKEN)
+  discordClient.login(DISCORD_TOKEN)
     .then(() => console.log("[Discord] Logged in"))
-    .catch((err) => console.error("[Discord] Login failed:", err));
+    .catch(err => console.error("[Discord] Login failed:", err));
 } else {
   console.warn("[Discord] No DISCORD_TOKEN set");
 }
 
-// ----- APP -----
+// ---------- APP ----------
 const app = express();
 app.use(cors());
 app.use(express.json({ limit: "25mb" }));
 
-// 🔹 Serve the Render disk so thumbnails/video can stream with range requests
-app.use(
-  "/static",
-  express.static(DATA_ROOT, {
-    fallthrough: true,
-    setHeaders(res) {
-      res.setHeader("Access-Control-Allow-Origin", "*");
-    },
-  })
-);
+// Serve the entire Render disk (supports range for media)
+app.use("/static", express.static(DATA_ROOT, {
+  fallthrough: true,
+  setHeaders(res) { res.setHeader("Access-Control-Allow-Origin", "*"); }
+}));
 
 const upload = multer({ dest: path.join(DATA_ROOT, "tmp") });
 
-// ----- HELPERS -----
-function ensureDir(p) {
-  if (!fs.existsSync(p)) fs.mkdirSync(p, { recursive: true });
-}
+// ---------- HELPERS ----------
+function ensureDir(p) { if (!fs.existsSync(p)) fs.mkdirSync(p, { recursive: true }); }
 function safeReadJson(file, fallback) {
-  try {
-    if (!fs.existsSync(file)) return fallback;
-    return JSON.parse(fs.readFileSync(file, "utf8"));
-  } catch {
-    return fallback;
-  }
+  try { if (!fs.existsSync(file)) return fallback; return JSON.parse(fs.readFileSync(file, "utf8")); }
+  catch { return fallback; }
+}
+function writeJson(file, obj) {
+  ensureDir(path.dirname(file));
+  fs.writeFileSync(file, JSON.stringify(obj, null, 2));
 }
 function requireAdmin(req, res, next) {
   const key = req.header("x-soapbox-key");
   if (ADMIN_KEY && key === ADMIN_KEY) return next();
   return res.status(401).json({ error: "Unauthorized" });
 }
-function listFiles(dir, exts) {
+function storyDirOf(id) { return path.join(DATA_ROOT, "Stories", id); }
+function urlFor(absPath) { return "/static" + absPath.replace(DATA_ROOT, "").replace(/\\/g, "/"); }
+function latestByMtime(dir, exts) {
   try {
-    if (!fs.existsSync(dir)) return [];
-    return fs
-      .readdirSync(dir)
-      .filter((n) => exts.some((e) => n.toLowerCase().endsWith(e)))
-      .map((name) => {
-        const p = path.join(dir, name);
-        const st = fs.statSync(p);
-        return { name, path: p, mtimeMs: st.mtimeMs || 0 };
-      })
-      .sort((a, b) => b.mtimeMs - a.mtimeMs);
-  } catch {
-    return [];
+    if (!fs.existsSync(dir)) return null;
+    const files = fs.readdirSync(dir)
+      .filter(n => exts.some(e => n.toLowerCase().endsWith(e)))
+      .map(n => ({ n, p: path.join(dir, n), m: fs.statSync(path.join(dir, n)).mtimeMs }))
+      .sort((a, b) => b.m - a.m);
+    return files[0] || null;
+  } catch { return null; }
+}
+function threadsMap() {
+  // Optional mapping file: /data/app/threads.json  -> { "Story1": "123456789012345678", ... }
+  return safeReadJson(path.join(DATA_ROOT, "app", "threads.json"), {});
+}
+async function postFileToDiscord(storyId, absFilePath, content = "") {
+  // Prefer external helper if present
+  if (externalPoster && typeof externalPoster === "function") {
+    return externalPoster(discordClient, storyId, absFilePath, content);
   }
+  // Internal: try per-story thread, else fallback channel
+  const map = threadsMap();
+  const targetId = map[storyId] || VOICEMAIL_CHANNEL_ID || SPOTLIGHT_CHANNEL_ID || CONFESSIONS_CHANNEL_ID;
+  if (!targetId) throw new Error("No Discord target (threads.json or VOICEMAIL_CHANNEL_ID)");
+  const ch = await discordClient.channels.fetch(targetId);
+  if (!ch) throw new Error("Discord channel/thread not found");
+  const file = new AttachmentBuilder(absFilePath);
+  return ch.send({ content, files: [file] });
 }
 
-// ----- STATIC ALIASES THE APP EXPECTS -----
-// The app asks for /static/:id/metadata.json (not /static/Stories/:id/metadata.json)
+// ---------- STATIC ALIASES THE APP EXPECTS ----------
 app.get("/static/:storyId/metadata.json", (req, res) => {
-  const file = path.join(DATA_ROOT, "Stories", req.params.storyId, "metadata.json");
+  const file = path.join(storyDirOf(req.params.storyId), "metadata.json");
   if (!fs.existsSync(file)) return res.status(404).json({ error: "Not found" });
   res.type("application/json").send(fs.readFileSync(file, "utf8"));
 });
-// And /static/:id/<anything> → /Stories/:id/<anything>
+// Alias /static/:id/*  →  /Stories/:id/*
 app.get("/static/:storyId/*", (req, res, next) => {
-  const rel = req.params[0] || "";
-  const file = path.join(DATA_ROOT, "Stories", req.params.storyId, rel);
+  const file = path.join(storyDirOf(req.params.storyId), req.params[0] || "");
   if (!fs.existsSync(file) || fs.statSync(file).isDirectory()) return next();
   res.sendFile(file);
 });
 
-// ----- HEALTH -----
-app.get("/health", (_req, res) =>
-  res.json({ ok: true, time: new Date().toISOString() })
-);
+// ---------- HEALTH ----------
+app.get("/health", (_req, res) => res.json({ ok: true, time: new Date().toISOString() }));
 
-// ----- LINKS / SPOTLIGHTS -----
-app.get("/links", (_req, res) => {
-  res.json(safeReadJson(path.join(DATA_ROOT, "app/links.json"), []));
+// ---------- LINKS / SPOTLIGHTS ----------
+app.get("/links", (_req, res) => res.json(safeReadJson(path.join(DATA_ROOT, "app/links.json"), [])));
+app.get("/spotlights", (_req, res) => res.json(safeReadJson(path.join(DATA_ROOT, "app/spotlights.json"), [])));
+
+app.post("/admin/links", requireAdmin, (req, res) => {
+  if (!Array.isArray(req.body)) return res.status(400).json({ error: "Body must be an array of {label,url}" });
+  writeJson(path.join(DATA_ROOT, "app/links.json"), req.body);
+  res.json({ ok: true, count: req.body.length });
 });
-app.get("/spotlights", (_req, res) => {
-  res.json(safeReadJson(path.join(DATA_ROOT, "app/spotlights.json"), []));
+app.post("/admin/spotlights", requireAdmin, async (req, res) => {
+  if (!Array.isArray(req.body)) return res.status(400).json({ error: "Body must be an array" });
+  writeJson(path.join(DATA_ROOT, "app/spotlights.json"), req.body);
+  // optional notify
+  if (SPOTLIGHT_CHANNEL_ID) {
+    try {
+      const ch = await discordClient.channels.fetch(SPOTLIGHT_CHANNEL_ID);
+      if (ch) await ch.send("✅ Spotlights updated");
+    } catch {}
+  }
+  res.json({ ok: true, count: req.body.length });
 });
 
-// ----- CONFESSIONS (GET + POST) -----
-app.get("/confessions", (_req, res) => {
-  res.json(safeReadJson(path.join(DATA_ROOT, "app/confessions.json"), []));
-});
+// ---------- CONFESSIONS ----------
+app.get("/confessions", (_req, res) => res.json(safeReadJson(path.join(DATA_ROOT, "app/confessions.json"), [])));
+
 app.post("/confessions", async (req, res) => {
   const { text } = req.body || {};
   if (!text) return res.status(400).json({ error: "Confession text required" });
-  try {
-    const file = path.join(DATA_ROOT, "app/confessions.json");
-    ensureDir(path.dirname(file));
-    const arr = safeReadJson(file, []);
-    arr.push({ text, at: new Date().toISOString() });
-    fs.writeFileSync(file, JSON.stringify(arr, null, 2));
-
-    if (CONFESSIONS_CHANNEL_ID) {
-      try {
-        const ch = await discordClient.channels.fetch(CONFESSIONS_CHANNEL_ID);
-        if (ch) await ch.send(text);
-      } catch (e) {
-        console.warn("[Discord] Confession post failed:", e.message);
-      }
-    }
-    res.json({ ok: true });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
+  const file = path.join(DATA_ROOT, "app/confessions.json");
+  const arr = safeReadJson(file, []);
+  arr.push({ text, at: new Date().toISOString() });
+  writeJson(file, arr);
+  // post to Discord channel if configured
+  if (CONFESSIONS_CHANNEL_ID) {
+    try {
+      const ch = await discordClient.channels.fetch(CONFESSIONS_CHANNEL_ID);
+      if (ch) await ch.send(text);
+    } catch (e) { console.warn("[Discord] Confession post failed:", e.message); }
   }
+  res.json({ ok: true });
 });
 
-// ----- ADMIN: LINKS & SPOTLIGHTS (replace files) -----
-app.post("/admin/links", requireAdmin, (req, res) => {
-  try {
-    if (!Array.isArray(req.body))
-      return res.status(400).json({ error: "Body must be an array of {label, url}" });
-    const file = path.join(DATA_ROOT, "app/links.json");
-    ensureDir(path.dirname(file));
-    fs.writeFileSync(file, JSON.stringify(req.body, null, 2));
-    res.json({ ok: true, count: req.body.length });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-app.post("/admin/spotlights", requireAdmin, (req, res) => {
-  try {
-    if (!Array.isArray(req.body))
-      return res.status(400).json({ error: "Body must be an array" });
-    const file = path.join(DATA_ROOT, "app/spotlights.json");
-    ensureDir(path.dirname(file));
-    fs.writeFileSync(file, JSON.stringify(req.body, null, 2));
-    if (SPOTLIGHT_CHANNEL_ID) {
-      discordClient.channels
-        .fetch(SPOTLIGHT_CHANNEL_ID)
-        .then((ch) => ch && ch.send("✅ Spotlights updated"))
-        .catch(() => {});
-    }
-    res.json({ ok: true, count: req.body.length });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// ----- STORIES (list) -----
+// ---------- STORIES (LIST) ----------
 app.get("/stories", (_req, res) => {
   try {
     const root = path.join(DATA_ROOT, "Stories");
@@ -186,11 +162,19 @@ app.get("/stories", (_req, res) => {
       const metaFile = path.join(dir, "metadata.json");
       if (fs.existsSync(dir) && fs.existsSync(metaFile)) {
         const meta = safeReadJson(metaFile, {});
-        // expose thumbnail URLs for the list view
-        const thumbRel =
-          meta.thumbnailYt || meta.youtubeThumbnail || meta.thumbnail || null;
+        const thumbRel = meta.thumbnailYt || meta.youtubeThumbnail || meta.thumbnail || null;
         const thumbUrl = thumbRel ? `/static/Stories/${id}/${thumbRel}` : null;
-        out.push({ id, title: meta.title || id, subtitle: meta.subtitle || "", thumbUrl });
+        const voicemailMp3 = path.join(dir, "voicemail.mp3");
+        const voicemailUrl = fs.existsSync(voicemailMp3) ? urlFor(voicemailMp3) : null;
+        out.push({
+          id,
+          title: meta.title || id,
+          subtitle: meta.subtitle || "",
+          active: !!meta.active,
+          prompts: Array.isArray(meta.prompts) ? meta.prompts : [],
+          thumbUrl,
+          voicemailUrl
+        });
       }
     }
     res.json(out);
@@ -199,139 +183,264 @@ app.get("/stories", (_req, res) => {
   }
 });
 
-// ----- VOICEMAIL (the route your app autoplays) -----
-// Returns a redirect to the newest .mp3 under /Stories/:id/voicemails
+// ---------- VOICEMAIL (APP AUTOPLAY) ----------
 app.get("/voicemail/:id", (req, res) => {
-  const id = String(req.params.id || "");
-  const dir = path.join(DATA_ROOT, "Stories", id, "voicemails");
-  const mp3s = listFiles(dir, [".mp3"]);
-  const choice = mp3s[0];
-  if (!choice) return res.status(404).json({ error: "No voicemail for this story" });
-  const rel = choice.path.replace(DATA_ROOT, "").replace(/\\/g, "/");
-  res.redirect(302, `/static${rel}`); // lets the client stream/seek
+  const mp3 = path.join(storyDirOf(req.params.id), "voicemail.mp3");
+  if (!fs.existsSync(mp3)) return res.status(404).json({ error: "No voicemail for this story" });
+  res.redirect(302, urlFor(mp3));
 });
 
-// ----- ADMIN: VOICEMAIL UPLOAD (mp3 -> mp4 for Discord) -----
-app.post(
-  "/admin/story/:id/voicemail",
-  requireAdmin,
-  upload.single("audio"),
-  async (req, res) => {
-    try {
-      const storyId = req.params.id;
-      if (!req.file) return res.status(400).json({ error: "Missing audio" });
+// ---------- ADMIN: STORY META / THUMB / THUMB-YT ----------
+app.post("/admin/story/:id/meta", requireAdmin, (req, res) => {
+  try {
+    const id = req.params.id;
+    const file = path.join(storyDirOf(id), "metadata.json");
+    const current = safeReadJson(file, { id });
+    const next = { ...current };
 
-      const storyDir = path.join(DATA_ROOT, "Stories", storyId);
-      const vmDir = path.join(storyDir, "voicemails");
-      ensureDir(vmDir);
+    if (typeof req.body.title === "string") next.title = req.body.title;
+    if (typeof req.body.subtitle === "string") next.subtitle = req.body.subtitle;
+    if (Array.isArray(req.body.prompts)) next.prompts = req.body.prompts;
 
-      const base = Date.now().toString();
-      const mp3Path = path.join(vmDir, `${base}.mp3`);
-      fs.renameSync(req.file.path, mp3Path);
-
-      const meta = safeReadJson(path.join(storyDir, "metadata.json"), {});
-      const thumb = meta.thumbnailYt
-        ? path.join(storyDir, meta.thumbnailYt)
-        : null;
-
-      const mp4Path = path.join(vmDir, `${base}.mp4`);
-      await makeVoicemailVideo(mp3Path, mp4Path, thumb || undefined);
-
-      // Post the mp4 to Discord (thread inferred in your helper)
-      await postToDiscord(discordClient, storyId, mp4Path);
-
-      // Return the public URLs so the app could use them if needed
-      const mp3Rel = mp3Path.replace(DATA_ROOT, "").replace(/\\/g, "/");
-      const mp4Rel = mp4Path.replace(DATA_ROOT, "").replace(/\\/g, "/");
-      res.json({ ok: true, mp3: `/static${mp3Rel}`, mp4: `/static${mp4Rel}` });
-    } catch (err) {
-      console.error(err);
-      res.status(500).json({ error: err.message });
+    // handle 'active' toggle: set this one active, others false
+    if (typeof req.body.active === "boolean" && req.body.active) {
+      const root = path.join(DATA_ROOT, "Stories");
+      if (fs.existsSync(root)) {
+        for (const otherId of fs.readdirSync(root)) {
+          const mf = path.join(root, otherId, "metadata.json");
+          if (fs.existsSync(mf)) {
+            const m = safeReadJson(mf, { id: otherId });
+            m.active = otherId === id;
+            writeJson(mf, m);
+          }
+        }
+      }
+    } else if (typeof req.body.active === "boolean") {
+      next.active = req.body.active;
     }
+
+    writeJson(file, next);
+    res.json({ ok: true, meta: next });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
   }
-);
+});
 
-// ----- ADMIN: WITNESS UPLOAD (mp4 -> Discord) -----
-app.post(
-  "/admin/story/:id/witness",
-  requireAdmin,
-  upload.single("video"),
-  async (req, res) => {
-    try {
-      const storyId = req.params.id;
-      if (!req.file) return res.status(400).json({ error: "Missing video" });
+app.post("/admin/story/:id/thumbnail", requireAdmin, upload.single("file"), (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ error: "Missing file" });
+    const id = req.params.id;
+    const dir = storyDirOf(id); ensureDir(dir);
+    const filename = req.file.originalname || "thumbnail.png";
+    const dest = path.join(dir, filename);
+    fs.renameSync(req.file.path, dest);
 
-      const storyDir = path.join(DATA_ROOT, "Stories", storyId);
-      const wtDir = path.join(storyDir, "witnesses");
-      ensureDir(wtDir);
+    const metaFile = path.join(dir, "metadata.json");
+    const meta = safeReadJson(metaFile, { id });
+    meta.thumbnail = filename;
+    writeJson(metaFile, meta);
 
-      const outPath = path.join(wtDir, `${Date.now()}.mp4`);
-      fs.renameSync(req.file.path, outPath);
+    res.json({ ok: true, thumbnail: urlFor(dest) });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
 
-      await postToDiscord(discordClient, storyId, outPath);
+app.post("/admin/story/:id/thumbnail-yt", requireAdmin, upload.single("file"), (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ error: "Missing file" });
+    const id = req.params.id;
+    const dir = storyDirOf(id); ensureDir(dir);
+    const filename = req.file.originalname || "thumbnail-yt.png";
+    const dest = path.join(dir, filename);
+    fs.renameSync(req.file.path, dest);
 
-      const rel = outPath.replace(DATA_ROOT, "").replace(/\\/g, "/");
-      res.json({ ok: true, url: `/static${rel}` });
-    } catch (err) {
-      console.error(err);
-      res.status(500).json({ error: err.message });
-    }
+    const metaFile = path.join(dir, "metadata.json");
+    const meta = safeReadJson(metaFile, { id });
+    meta.thumbnailYt = filename;
+    writeJson(metaFile, meta);
+
+    res.json({ ok: true, thumbnailYt: urlFor(dest) });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ---------- ADMIN: VOICEMAIL (per story) ----------
+app.post("/admin/story/:id/voicemail", requireAdmin, upload.single("audio"), async (req, res) => {
+  try {
+    const storyId = req.params.id;
+    if (!req.file) return res.status(400).json({ error: "Missing audio" });
+
+    const dir = storyDirOf(storyId); ensureDir(dir);
+
+    const mp3Path = path.join(dir, "voicemail.mp3");
+    const mp4Path = path.join(dir, "voicemail.mp4");
+
+    try { fs.unlinkSync(mp3Path); } catch {}
+    fs.renameSync(req.file.path, mp3Path);
+
+    const meta = safeReadJson(path.join(dir, "metadata.json"), {});
+    const ytThumb = meta.thumbnailYt || meta.youtubeThumbnail
+      ? path.join(dir, meta.thumbnailYt || meta.youtubeThumbnail)
+      : null;
+
+    await makeVoicemailVideo(mp3Path, mp4Path, ytThumb || undefined);
+
+    // post to correct Discord thread (from /data/app/threads.json)
+    await postFileToDiscord(storyId, mp4Path, `📣 Voicemail for **${storyId}**`);
+
+    res.json({ ok: true, mp3: urlFor(mp3Path), mp4: urlFor(mp4Path) });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: err.message });
   }
-);
+});
 
-// ----- ROTATE STORIES -----
-function storyIds() {
+// ---------- ADMIN: WITNESS (per story) ----------
+app.post("/admin/story/:id/witness", requireAdmin, upload.single("video"), async (req, res) => {
+  try {
+    const storyId = req.params.id;
+    if (!req.file) return res.status(400).json({ error: "Missing video" });
+
+    const wtDir = path.join(storyDirOf(storyId), "witnesses"); ensureDir(wtDir);
+    const outPath = path.join(wtDir, `${Date.now()}.mp4`);
+    fs.renameSync(req.file.path, outPath);
+
+    await postFileToDiscord(storyId, outPath, `🎥 Witness submission — **${storyId}**`);
+
+    res.json({ ok: true, url: urlFor(outPath) });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ---------- ADMIN: ROTATE STORIES ----------
+function allStoryIds() {
   const root = path.join(DATA_ROOT, "Stories");
   if (!fs.existsSync(root)) return [];
-  return fs
-    .readdirSync(root)
-    .filter((id) => fs.existsSync(path.join(root, id, "metadata.json")));
+  return fs.readdirSync(root).filter(id => fs.existsSync(path.join(root, id, "metadata.json")));
 }
-function readMeta(id) {
-  return safeReadJson(path.join(DATA_ROOT, "Stories", id, "metadata.json"), { id });
-}
-function writeMeta(id, meta) {
-  const file = path.join(DATA_ROOT, "Stories", id, "metadata.json");
-  ensureDir(path.dirname(file));
-  fs.writeFileSync(file, JSON.stringify({ id, ...meta }, null, 2));
-}
+function readMeta(id) { return safeReadJson(path.join(DATA_ROOT, "Stories", id, "metadata.json"), { id }); }
+function writeMeta(id, meta) { writeJson(path.join(DATA_ROOT, "Stories", id, "metadata.json"), { id, ...meta }); }
+
 function setActive(targetId) {
-  const ids = storyIds();
+  const ids = allStoryIds();
   if (!ids.includes(targetId)) throw new Error(`Story '${targetId}' not found`);
   let activeMeta = null;
-  ids.forEach((id) => {
-    const meta = readMeta(id);
-    meta.active = id === targetId;
-    writeMeta(id, meta);
-    if (meta.active) activeMeta = meta;
+  ids.forEach(id => {
+    const m = readMeta(id);
+    m.active = id === targetId;
+    writeMeta(id, m);
+    if (m.active) activeMeta = m;
   });
   return { activeId: targetId, meta: activeMeta, ids };
 }
+
 app.post("/admin/rotate-story/:id", requireAdmin, (req, res) => {
-  try {
-    const result = setActive(req.params.id);
-    res.json({ ok: true, ...result });
-  } catch (err) {
-    res.status(400).json({ error: err.message });
-  }
+  try { res.json({ ok: true, ...setActive(req.params.id) }); }
+  catch (err) { res.status(400).json({ error: err.message }); }
 });
 app.post("/admin/rotate-stories", requireAdmin, (req, res) => {
   try {
-    const ids = storyIds();
-    if (ids.length === 0) return res.status(400).json({ error: "No stories" });
-    const currentIndex = ids.findIndex((id) => readMeta(id).active);
-    const next = currentIndex >= 0 ? (currentIndex + 1) % ids.length : 0;
-    const result = setActive(ids[next]);
-    res.json({ ok: true, ...result });
+    const ids = allStoryIds();
+    if (!ids.length) return res.status(400).json({ error: "No stories" });
+    const curIdx = ids.findIndex(id => readMeta(id).active);
+    const next = curIdx >= 0 ? (curIdx + 1) % ids.length : 0;
+    res.json({ ok: true, ...setActive(ids[next]) });
+  } catch (err) { res.status(400).json({ error: err.message }); }
+});
+
+// ---------- ADMIN: EXPORT (ZIP originals) ----------
+// GET /admin/export            -> all stories
+// GET /admin/export?story=ID   -> one story
+app.get("/admin/export", requireAdmin, (req, res) => {
+  try {
+    const story = (req.query.story || "").trim();
+    const root = path.join(DATA_ROOT, "Stories");
+    if (!fs.existsSync(root)) return res.status(400).json({ error: "No stories directory" });
+
+    const filename = story
+      ? `export-${story}-${new Date().toISOString().split("T")[0]}.zip`
+      : `export-all-${new Date().toISOString().split("T")[0]}.zip`;
+
+    res.setHeader("Content-Type", "application/zip");
+    res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
+
+    const archive = archiver("zip", { zlib: { level: 9 } });
+    archive.on("error", err => { throw err; });
+    archive.pipe(res);
+
+    const addStory = (id) => {
+      const dir = path.join(root, id);
+      const metaFile = path.join(dir, "metadata.json");
+      if (!fs.existsSync(metaFile)) return;
+
+      // include metadata, thumbnails, voicemail.mp3, witnesses/**
+      archive.file(metaFile, { name: `${id}/metadata.json` });
+
+      const meta = safeReadJson(metaFile, {});
+      const thumbs = [meta.thumbnail, meta.thumbnailYt, meta.youtubeThumbnail]
+        .filter(Boolean)
+        .map(fn => path.join(dir, fn))
+        .filter(p => fs.existsSync(p));
+      thumbs.forEach((p, i) => archive.file(p, { name: `${id}/thumb-${i+1}${path.extname(p)}` }));
+
+      const vmp3 = path.join(dir, "voicemail.mp3");
+      if (fs.existsSync(vmp3)) archive.file(vmp3, { name: `${id}/voicemail.mp3` });
+
+      const vmp4 = path.join(dir, "voicemail.mp4");
+      if (fs.existsSync(vmp4)) archive.file(vmp4, { name: `${id}/voicemail.mp4` });
+
+      const witDir = path.join(dir, "witnesses");
+      if (fs.existsSync(witDir)) archive.directory(witDir, `${id}/witnesses`);
+    };
+
+    if (story) {
+      addStory(story);
+    } else {
+      for (const id of fs.readdirSync(root)) addStory(id);
+    }
+
+    archive.finalize();
   } catch (err) {
-    res.status(400).json({ error: err.message });
+    console.error(err);
+    res.status(500).json({ error: err.message });
   }
 });
 
-// ----- 404 -----
+// ---------- NEW: DISCORD VOICEMAIL INBOX (global channel post) ----------
+app.post("/admin/discord/voicemail", requireAdmin, upload.single("audio"), async (req, res) => {
+  try {
+    if (!VOICEMAIL_CHANNEL_ID) return res.status(400).json({ error: "VOICEMAIL_CHANNEL_ID not set" });
+    if (!req.file) return res.status(400).json({ error: "Missing audio" });
+
+    const inboxDir = path.join(DATA_ROOT, "inbox", "discord-voicemails"); ensureDir(inboxDir);
+    const postedDir = path.join(DATA_ROOT, "posted", "discord-voicemails"); ensureDir(postedDir);
+
+    const base = Date.now().toString();
+    const mp3Path = path.join(inboxDir, `${base}.mp3`);
+    fs.renameSync(req.file.path, mp3Path);
+
+    const defaultThumb = path.join(DATA_ROOT, "app", "megaphone.png");
+    const mp4Path = path.join(inboxDir, `${base}.mp4`);
+    await makeVoicemailVideo(mp3Path, mp4Path, fs.existsSync(defaultThumb) ? defaultThumb : undefined);
+
+    const ch = await discordClient.channels.fetch(VOICEMAIL_CHANNEL_ID);
+    if (!ch) return res.status(500).json({ error: "Discord channel not found" });
+    await ch.send({ content: "📬 New voicemail", files: [new AttachmentBuilder(mp4Path)] });
+
+    fs.renameSync(mp3Path, path.join(postedDir, `${base}.mp3`));
+    fs.renameSync(mp4Path, path.join(postedDir, `${base}.mp4`));
+
+    res.json({ ok: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ---------- 404 ----------
 app.use((_req, res) => res.status(404).json({ error: "Not found" }));
 
-// ----- START -----
+// ---------- START ----------
 const PORT = process.env.PORT || 3030;
 app.listen(PORT, () => {
   console.log("[Server] Listening on", PORT);
