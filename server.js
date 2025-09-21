@@ -175,13 +175,54 @@ app.get("/stories", (_req, res) => {
 });
 
 // ---------- VOICEMAIL (APP AUTOPLAY) ----------
+// ---------- VOICEMAIL (APP AUTOPLAY + PLAY BUTTON WORK) ----------
+const mime = require("mime-types");
+
 app.get("/voicemail/:id", (req, res) => {
-  const meta = readStoryMeta(req.params.id);
-  const vmFile = voicemailFilenameFromMeta(meta);
-  const abs = absStoryPath(req.params.id, vmFile);
-  if (!fs.existsSync(abs)) return res.status(404).json({ error: "No voicemail for this story" });
-  res.redirect(302, urlFor(abs));
+  try {
+    const id = req.params.id;
+    const meta = readStoryMeta(id);
+    const vmFile = voicemailFilenameFromMeta(meta);           // exact filename from metadata
+    const abs = absStoryPath(id, vmFile);
+    if (!fs.existsSync(abs)) return res.status(404).json({ error: "No voicemail for this story" });
+
+    // CORS
+    res.setHeader("Access-Control-Allow-Origin", "*");
+    res.setHeader("Accept-Ranges", "bytes");
+
+    const stat = fs.statSync(abs);
+    const range = req.headers.range;
+
+    const ctype = mime.lookup(abs) || "audio/mpeg";
+
+    if (range) {
+      const m = /^bytes=(\d+)-(\d*)$/.exec(range);
+      if (!m) return res.status(416).end(); // invalid range
+      const start = parseInt(m[1], 10);
+      const end = m[2] ? parseInt(m[2], 10) : stat.size - 1;
+      if (start >= stat.size || end >= stat.size) return res.status(416).end();
+
+      const chunk = (end - start) + 1;
+      res.writeHead(206, {
+        "Content-Range": `bytes ${start}-${end}/${stat.size}`,
+        "Content-Length": chunk,
+        "Content-Type": ctype,
+      });
+      fs.createReadStream(abs, { start, end }).pipe(res);
+      return;
+    }
+
+    res.writeHead(200, {
+      "Content-Length": stat.size,
+      "Content-Type": ctype,
+    });
+    fs.createReadStream(abs).pipe(res);
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: e.message });
+  }
 });
+
 
 // ---------- ADMIN: STORY META / THUMB / THUMB-YT ----------
 app.post("/admin/story/:id/meta", requireAdmin, (req, res) => {
