@@ -48,6 +48,40 @@ app.use("/static", express.static(DATA_ROOT, {
 const upload = multer({ dest: path.join(DATA_ROOT, "tmp") });
 
 // ---------- HELPERS ----------
+function voicemailRelFromMeta(meta) {
+  const v = (meta && typeof meta.voicemail === "string") ? meta.voicemail.trim() : "";
+  return v || "voicemail.mp3";
+}
+
+// Return ABS path if exists, trying:
+// - exact rel from meta if it contains a slash (treat as relative path)
+// - <StoryId>/<filename>
+// - <StoryId>/voicemail/<filename>
+function resolveVoicemailAbs(storyId, meta) {
+  const rel = voicemailRelFromMeta(meta);
+  const dir = storyDirOf(storyId);
+
+  // If metadata already includes a subfolder (e.g. "voicemail/Crawl....mp3")
+  if (rel.includes("/")) {
+    const abs = path.join(dir, rel);
+    return fs.existsSync(abs) ? abs : null;
+  }
+
+  // 1) <StoryId>/<filename>
+  const abs1 = path.join(dir, rel);
+  if (fs.existsSync(abs1)) return abs1;
+
+  // 2) <StoryId>/voicemail/<filename>
+  const abs2 = path.join(dir, "voicemail", rel);
+  if (fs.existsSync(abs2)) return abs2;
+
+  return null;
+}
+
+function urlFromAbs(absPath) {
+  return absPath ? ("/static" + absPath.replace(DATA_ROOT, "").replace(/\\/g, "/")) : null;
+}
+
 function ensureDir(p) { if (!fs.existsSync(p)) fs.mkdirSync(p, { recursive: true }); }
 function safeReadJson(file, fallback) {
   try { if (!fs.existsSync(file)) return fallback; return JSON.parse(fs.readFileSync(file, "utf8")); }
@@ -180,26 +214,24 @@ const mime = require("mime-types");
 
 app.get("/voicemail/:id", (req, res) => {
   try {
-    const id = req.params.id;
+    const id   = req.params.id;
     const meta = readStoryMeta(id);
-    const vmFile = voicemailFilenameFromMeta(meta);           // exact filename from metadata
-    const abs = absStoryPath(id, vmFile);
-    if (!fs.existsSync(abs)) return res.status(404).json({ error: "No voicemail for this story" });
+    const abs  = resolveVoicemailAbs(id, meta);
+    if (!abs) return res.status(404).json({ error: "No voicemail for this story" });
 
-    // CORS
+    // CORS + Range support (kept)
     res.setHeader("Access-Control-Allow-Origin", "*");
     res.setHeader("Accept-Ranges", "bytes");
 
-    const stat = fs.statSync(abs);
+    const stat  = fs.statSync(abs);
     const range = req.headers.range;
-
-    const ctype = mime.lookup(abs) || "audio/mpeg";
+    const ctype = (require("mime-types").lookup(abs)) || "audio/mpeg";
 
     if (range) {
       const m = /^bytes=(\d+)-(\d*)$/.exec(range);
-      if (!m) return res.status(416).end(); // invalid range
+      if (!m) return res.status(416).end();
       const start = parseInt(m[1], 10);
-      const end = m[2] ? parseInt(m[2], 10) : stat.size - 1;
+      const end   = m[2] ? parseInt(m[2], 10) : stat.size - 1;
       if (start >= stat.size || end >= stat.size) return res.status(416).end();
 
       const chunk = (end - start) + 1;
@@ -208,20 +240,17 @@ app.get("/voicemail/:id", (req, res) => {
         "Content-Length": chunk,
         "Content-Type": ctype,
       });
-      fs.createReadStream(abs, { start, end }).pipe(res);
-      return;
+      return fs.createReadStream(abs, { start, end }).pipe(res);
     }
 
-    res.writeHead(200, {
-      "Content-Length": stat.size,
-      "Content-Type": ctype,
-    });
+    res.writeHead(200, { "Content-Length": stat.size, "Content-Type": ctype });
     fs.createReadStream(abs).pipe(res);
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: e.message });
   }
 });
+
 
 
 // ---------- ADMIN: STORY META / THUMB / THUMB-YT ----------
@@ -302,11 +331,16 @@ app.post("/admin/story/:id/voicemail", requireAdmin, upload.single("audio"), asy
     const storyId = req.params.id;
     if (!req.file) return res.status(400).json({ error: "Missing audio" });
 
-    const dir = storyDirOf(storyId); ensureDir(dir);
-    const meta = readStoryMeta(storyId);
-    const vmFile = voicemailFilenameFromMeta(meta);
-    const mp3Path = absStoryPath(storyId, vmFile);
-    const mp4Path = absStoryPath(storyId, vmFile.replace(/\.[^.]+$/, "") + ".mp4");
+    const meta    = readStoryMeta(storyId);
+const rel     = voicemailRelFromMeta(meta);
+// If rel has a folder, write exactly there; else default to story root.
+const mp3Path = path.join(storyDirOf(storyId), rel);
+ensureDir(path.dirname(mp3Path));
+const mp4Path = path.join(
+  storyDirOf(storyId),
+  rel.replace(/\.[^.]+$/, "") + ".mp4"
+);
+
 
     try { fs.unlinkSync(mp3Path); } catch {}
     fs.renameSync(req.file.path, mp3Path);
