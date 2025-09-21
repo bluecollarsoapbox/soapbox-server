@@ -88,11 +88,16 @@ async function postFileToDiscord(storyId, absFilePath, content = "") {
 }
 
 // ---------- STATIC ALIASES THE APP EXPECTS ----------
-app.get("/static/:storyId/metadata.json", (req, res) => {
-  const file = path.join(storyDirOf(req.params.storyId), "metadata.json");
-  if (!fs.existsSync(file)) return res.status(404).json({ error: "Not found" });
-  res.type("application/json").send(fs.readFileSync(file, "utf8"));
+// Alias /static/:storyId/<anything>  →  /Stories/:storyId/<anything>
+// (RegExp avoids path-to-regexp parsing issues in Express 5)
+app.get(/^\/static\/([^/]+)\/(.*)$/, (req, res, next) => {
+  const storyId = req.params[0];
+  const rest    = req.params[1] || "";
+  const file    = path.join(storyDirOf(storyId), rest);
+  if (!fs.existsSync(file) || fs.statSync(file).isDirectory()) return next();
+  res.sendFile(file);
 });
+
 
 // Alias /static/:id/*  →  /Stories/:id/*
 app.get("/static/:storyId/*", (req, res, next) => {
