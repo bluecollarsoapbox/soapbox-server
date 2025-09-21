@@ -95,12 +95,13 @@ app.get("/static/:storyId/metadata.json", (req, res) => {
 });
 
 // Alias /static/:id/*  →  /Stories/:id/*
-app.get("/static/:storyId/:rest*", (req, res, next) => {
-  const rest = req.params.rest || "";
+app.get("/static/:storyId/*", (req, res, next) => {
+  const rest = req.params[0] || ""; // wildcard segment
   const file = path.join(storyDirOf(req.params.storyId), rest);
   if (!fs.existsSync(file) || fs.statSync(file).isDirectory()) return next();
   res.sendFile(file);
 });
+
 
 // ---------- HEALTH ----------
 app.get("/health", (_req, res) => res.json({ ok: true, time: new Date().toISOString() }));
