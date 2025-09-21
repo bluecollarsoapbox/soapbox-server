@@ -96,7 +96,7 @@ app.get("/static/:storyId/metadata.json", (req, res) => {
 });
 
 // Alias /static/:id/*  →  /Stories/:id/*
-app.get("/static/:storyId/:rest(*)", (req, res, next) => {
+app.get("/static/:storyId/:rest*", (req, res, next) => {
   const rest = req.params.rest || "";
   const file = path.join(storyDirOf(req.params.storyId), rest);
   if (!fs.existsSync(file) || fs.statSync(file).isDirectory()) return next();
