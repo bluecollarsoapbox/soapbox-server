@@ -176,6 +176,72 @@ app.get("/spotlight-videos", (_req, res) => {
   }
 });
 
+// ---------- SPOTLIGHTS (folder-based) ----------
+// Reads:  DATA_ROOT/Spotlights/<Folder>/
+// Files per spotlight folder (case-insensitive is fine):
+//   - title or title.txt         (plain text)
+//   - link  or link.txt          (plain text, full URL to open)
+//   - any image (jpg/jpeg/png/webp) as the thumbnail
+app.get("/spotlight-videos", (_req, res) => {
+  try {
+    const spotRoot = path.join(DATA_ROOT, "Spotlights");
+    if (!fs.existsSync(spotRoot)) return res.json([]);
+
+    const isImg = (f) => /\.(jpe?g|png|webp|gif)$/i.test(f);
+    const readTxt = (p) => {
+      try { return fs.readFileSync(p, "utf8").trim(); } catch { return ""; }
+    };
+
+    const items = [];
+    for (const name of fs.readdirSync(spotRoot)) {
+      const dir = path.join(spotRoot, name);
+      if (!fs.existsSync(dir) || !fs.statSync(dir).isDirectory()) continue;
+
+      // tolerate both no-extension and .txt files
+      const titlePath = fs.existsSync(path.join(dir, "title")) ? path.join(dir, "title")
+        : fs.existsSync(path.join(dir, "title.txt")) ? path.join(dir, "title.txt")
+        : null;
+      const linkPath = fs.existsSync(path.join(dir, "link")) ? path.join(dir, "link")
+        : fs.existsSync(path.join(dir, "link.txt")) ? path.join(dir, "link.txt")
+        : null;
+
+      const title = titlePath ? readTxt(titlePath) : name;
+      const url   = linkPath ? readTxt(linkPath) : "";
+
+      // prefer files starting with "spotlight", fall back to the first image
+      const files = fs.readdirSync(dir);
+      const imgsPref = files.filter(f => /^spotlight.*\.(jpe?g|png|webp|gif)$/i.test(f));
+      const imgsAny  = files.filter(isImg);
+      const imgFile  = imgsPref[0] || imgsAny[0] || null;
+
+      if (!imgFile || !url) {
+        // Skip incomplete spotlight folders
+        continue;
+      }
+
+      const imgAbs = path.join(dir, imgFile);
+      const mtime  = fs.statSync(imgAbs).mtimeMs || fs.statSync(dir).mtimeMs;
+
+      items.push({
+        id: name,
+        title,
+        url,
+        thumb: urlFor(imgAbs),   // served via /static (we mounted DATA_ROOT there)
+        date: new Date(mtime).toISOString(),
+      });
+    }
+
+    // newest first
+    items.sort((a, b) => (b.date || "").localeCompare(a.date || ""));
+    res.json(items);
+  } catch (err) {
+    console.error("[/spotlight-videos]", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+
+
 app.post("/admin/links", requireAdmin, (req, res) => {
   if (!Array.isArray(req.body)) return res.status(400).json({ error: "Body must be an array of {label,url}" });
   writeJson(path.join(DATA_ROOT, "app/links.json"), req.body);
