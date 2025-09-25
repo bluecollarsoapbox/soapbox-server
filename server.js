@@ -127,6 +127,55 @@ app.get("/health", (_req, res) => res.json({ ok: true, time: new Date().toISOStr
 app.get("/links", (_req, res) => res.json(safeReadJson(path.join(DATA_ROOT, "app/links.json"), [])));
 app.get("/spotlights", (_req, res) => res.json(safeReadJson(path.join(DATA_ROOT, "app/spotlights.json"), [])));
 
+// ✅ Filesystem-based Spotlight cards (what your app expects)
+const IMAGE_EXTS = [".jpg", ".jpeg", ".png", ".webp", ".gif"];
+app.get("/spotlight-videos", (_req, res) => {
+  try {
+    const root = path.join(DATA_ROOT, "Spotlights");
+    if (!fs.existsSync(root)) return res.json([]);
+
+    const dirs = fs.readdirSync(root)
+      .map(name => ({ name, full: path.join(root, name) }))
+      .filter(d => { try { return fs.statSync(d.full).isDirectory(); } catch { return false; } });
+
+    const items = dirs.map(d => {
+      const titleFile = path.join(d.full, "title.txt");
+      const linkFile  = path.join(d.full, "link.txt");
+
+      // first image in the folder
+      let thumbName = null;
+      for (const f of fs.readdirSync(d.full)) {
+        const ext = path.extname(f).toLowerCase();
+        if (IMAGE_EXTS.includes(ext)) { thumbName = f; break; }
+      }
+
+      const title = fs.existsSync(titleFile)
+        ? fs.readFileSync(titleFile, "utf8").trim()
+        : d.name;
+
+      const url = fs.existsSync(linkFile)
+        ? fs.readFileSync(linkFile, "utf8").trim()
+        : "";
+
+      const thumb = thumbName
+        ? `/static/Spotlights/${encodeURIComponent(d.name)}/${encodeURIComponent(thumbName)}`
+        : "";
+
+      // sort newest first by folder mtime
+      let mtime = 0;
+      try { mtime = fs.statSync(d.full).mtimeMs; } catch {}
+
+      return { id: d.name, title, url, thumb, date: mtime ? new Date(mtime).toISOString() : undefined };
+    });
+
+    items.sort((a, b) => (b.date ? Date.parse(b.date) : 0) - (a.date ? Date.parse(a.date) : 0));
+    res.json(items);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.post("/admin/links", requireAdmin, (req, res) => {
   if (!Array.isArray(req.body)) return res.status(400).json({ error: "Body must be an array of {label,url}" });
   writeJson(path.join(DATA_ROOT, "app/links.json"), req.body);
@@ -168,7 +217,7 @@ app.get("/stories", (_req, res) => {
       if (fs.existsSync(dir) && fs.existsSync(metaFile)) {
         const meta = safeReadJson(metaFile, {});
         const thumbRel = meta.thumbnailYt || meta.youtubeThumbnail || meta.thumbnail || null;
-        const thumbUrl = thumbRel ? `/static/Stories/${id}/${thumbRel}` : null;
+        const thumbUrl = thumbRel ? `/static/Stories/${encodeURIComponent(id)}/${encodeURIComponent(thumbRel)}` : null;
 
         const vmAbs = findVoicemailPath(id);
         const voicemailUrl = vmAbs ? urlFor(vmAbs) : null;
@@ -254,7 +303,7 @@ app.post("/admin/story/:id/thumbnail-yt", requireAdmin, upload.single("file"), (
   try {
     if (!req.file) return res.status(400).json({ error: "Missing file" });
     const id = req.params.id;
-    const dir = storyDirOf(id); ensureDir(dir);
+    the dir = storyDirOf(id); ensureDir(dir);
     const filename = req.file.originalname || "thumbnail-yt.png";
     const dest = path.join(dir, filename);
     fs.renameSync(req.file.path, dest);
