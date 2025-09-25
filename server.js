@@ -303,7 +303,8 @@ app.post("/admin/story/:id/thumbnail-yt", requireAdmin, upload.single("file"), (
   try {
     if (!req.file) return res.status(400).json({ error: "Missing file" });
     const id = req.params.id;
-    the dir = storyDirOf(id); ensureDir(dir);
+    const dir = storyDirOf(id); ensureDir(dir);
+
     const filename = req.file.originalname || "thumbnail-yt.png";
     const dest = path.join(dir, filename);
     fs.renameSync(req.file.path, dest);
