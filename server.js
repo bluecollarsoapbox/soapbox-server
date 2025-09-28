@@ -1,6 +1,6 @@
 // SOAPBOX SERVER — Render disk + legacy voicemail-folder behavior
 // Source of truth on Render disk: /opt/render/project/data
-// If Stories/<id>/voicemail/ has a single .mp3, use it. Otherwise:
+// If Stories/<id>/voicemail/ has a .mp3, use it. Otherwise:
 //   1) metadata.voicemail  2) Stories/<id>/voicemail.mp3
 
 const express = require("express");
@@ -20,10 +20,10 @@ const makeVoicemailVideo = require("./makeVoicemailVideo");
 const DATA_ROOT = process.env.DATA_DIR || process.env.DATA_ROOT || "/opt/render/project/data";
 const ADMIN_KEY  = process.env.SOAPBOX_API_KEY || "changeme";
 
-const DISCORD_TOKEN            = process.env.DISCORD_TOKEN            || "";
-const CONFESSIONS_CHANNEL_ID   = process.env.CONFESSIONS_CHANNEL_ID   || "";
-const SPOTLIGHT_CHANNEL_ID     = process.env.SPOTLIGHT_CHANNEL_ID     || "";
-const VOICEMAIL_CHANNEL_ID     = process.env.VOICEMAIL_CHANNEL_ID     || ""; // fallback target
+const DISCORD_TOKEN          = process.env.DISCORD_TOKEN          || "";
+const CONFESSIONS_CHANNEL_ID = process.env.CONFESSIONS_CHANNEL_ID || "";
+const SPOTLIGHT_CHANNEL_ID   = process.env.SPOTLIGHT_CHANNEL_ID   || "";
+const VOICEMAIL_CHANNEL_ID   = process.env.VOICEMAIL_CHANNEL_ID   || ""; // fallback target
 
 // ---------- DISCORD ----------
 const discordClient = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages] });
@@ -71,11 +71,11 @@ function readStoryMeta(id) {
 // ---- LEGACY: find voicemail MP3 like it used to ----
 function findVoicemailPath(storyId) {
   const dir = storyDirOf(storyId);
-  // 1) Folder “voicemail” with one .mp3
+  // 1) Folder “voicemail” with first .mp3
   const vmFolder = path.join(dir, "voicemail");
   if (fs.existsSync(vmFolder) && fs.statSync(vmFolder).isDirectory()) {
     const mp3s = (fs.readdirSync(vmFolder) || []).filter(f => /\.mp3$/i.test(f));
-    if (mp3s.length >= 1) return path.join(vmFolder, mp3s[0]); // first mp3
+    if (mp3s.length >= 1) return path.join(vmFolder, mp3s[0]);
   }
   // 2) metadata.voicemail
   const meta = readStoryMeta(storyId);
@@ -83,7 +83,7 @@ function findVoicemailPath(storyId) {
     const abs = path.join(dir, meta.voicemail.trim());
     if (fs.existsSync(abs)) return abs;
   }
-  // 3) default file in story root
+  // 3) default in story root
   const fallback = path.join(dir, "voicemail.mp3");
   if (fs.existsSync(fallback)) return fallback;
 
@@ -91,7 +91,7 @@ function findVoicemailPath(storyId) {
 }
 
 async function postFileToDiscord(storyId, absFilePath, content = "") {
-  // Prefer your existing poster (keeps thread routing, formatting)
+  // Prefer your existing poster (keeps thread routing)
   if (externalPoster && typeof externalPoster === "function") {
     try { return await externalPoster(discordClient, storyId, absFilePath, content); }
     catch (e) { console.warn("[DiscordPoster] external poster failed, falling back:", e.message); }
@@ -104,8 +104,8 @@ async function postFileToDiscord(storyId, absFilePath, content = "") {
 }
 
 // ---------- STATIC ALIASES THE APP EXPECTS ----------
-// Express 5’s path-to-regexp is strict; avoid the old `:rest*` pattern.
-// Use a RegExp route to map /static/<id>/<rest> to the story folder:
+// Express 5: use RegExp route to avoid path-to-regexp errors
+// Maps /static/<storyId>/<rest> → DATA_ROOT/Stories/<storyId>/<rest>
 app.get(/^\/static\/([^/]+)\/(.+)$/, (req, res, next) => {
   const storyId = req.params[0];
   const restRel = req.params[1];
@@ -123,81 +123,30 @@ app.get("/static/:storyId/metadata.json", (req, res) => {
 // ---------- HEALTH ----------
 app.get("/health", (_req, res) => res.json({ ok: true, time: new Date().toISOString() }));
 
-// ---------- LINKS / SPOTLIGHTS ----------
+// ---------- LINKS / SPOTLIGHTS (JSON) ----------
 app.get("/links", (_req, res) => res.json(safeReadJson(path.join(DATA_ROOT, "app/links.json"), [])));
 app.get("/spotlights", (_req, res) => res.json(safeReadJson(path.join(DATA_ROOT, "app/spotlights.json"), [])));
 
-// ✅ Filesystem-based Spotlight cards (what your app expects)
+// ---------- SPOTLIGHTS (FOLDER-BASED LIST THE APP USES) ----------
+// Reads: DATA_ROOT/Spotlights/<Folder>/
+// Files per spotlight folder (case-insensitive OK):
+//   - title or title.txt     (plain text)
+//   - link  or link.txt      (plain text full URL)
+//   - any image (jpg/jpeg/png/webp/gif) → thumbnail
 const IMAGE_EXTS = [".jpg", ".jpeg", ".png", ".webp", ".gif"];
-app.get("/spotlight-videos", (_req, res) => {
-  try {
-    const root = path.join(DATA_ROOT, "Spotlights");
-    if (!fs.existsSync(root)) return res.json([]);
-
-    const dirs = fs.readdirSync(root)
-      .map(name => ({ name, full: path.join(root, name) }))
-      .filter(d => { try { return fs.statSync(d.full).isDirectory(); } catch { return false; } });
-
-    const items = dirs.map(d => {
-      const titleFile = path.join(d.full, "title.txt");
-      const linkFile  = path.join(d.full, "link.txt");
-
-      // first image in the folder
-      let thumbName = null;
-      for (const f of fs.readdirSync(d.full)) {
-        const ext = path.extname(f).toLowerCase();
-        if (IMAGE_EXTS.includes(ext)) { thumbName = f; break; }
-      }
-
-      const title = fs.existsSync(titleFile)
-        ? fs.readFileSync(titleFile, "utf8").trim()
-        : d.name;
-
-      const url = fs.existsSync(linkFile)
-        ? fs.readFileSync(linkFile, "utf8").trim()
-        : "";
-
-      const thumb = thumbName
-        ? `/static/Spotlights/${encodeURIComponent(d.name)}/${encodeURIComponent(thumbName)}`
-        : "";
-
-      // sort newest first by folder mtime
-      let mtime = 0;
-      try { mtime = fs.statSync(d.full).mtimeMs; } catch {}
-
-      return { id: d.name, title, url, thumb, date: mtime ? new Date(mtime).toISOString() : undefined };
-    });
-
-    items.sort((a, b) => (b.date ? Date.parse(b.date) : 0) - (a.date ? Date.parse(a.date) : 0));
-    res.json(items);
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// ---------- SPOTLIGHTS (folder-based) ----------
-// Reads:  DATA_ROOT/Spotlights/<Folder>/
-// Files per spotlight folder (case-insensitive is fine):
-//   - title or title.txt         (plain text)
-//   - link  or link.txt          (plain text, full URL to open)
-//   - any image (jpg/jpeg/png/webp) as the thumbnail
 app.get("/spotlight-videos", (_req, res) => {
   try {
     const spotRoot = path.join(DATA_ROOT, "Spotlights");
     if (!fs.existsSync(spotRoot)) return res.json([]);
 
     const isImg = (f) => /\.(jpe?g|png|webp|gif)$/i.test(f);
-    const readTxt = (p) => {
-      try { return fs.readFileSync(p, "utf8").trim(); } catch { return ""; }
-    };
+    const readTxt = (p) => { try { return fs.readFileSync(p, "utf8").trim(); } catch { return ""; } };
 
     const items = [];
     for (const name of fs.readdirSync(spotRoot)) {
       const dir = path.join(spotRoot, name);
       if (!fs.existsSync(dir) || !fs.statSync(dir).isDirectory()) continue;
 
-      // tolerate both no-extension and .txt files
       const titlePath = fs.existsSync(path.join(dir, "title")) ? path.join(dir, "title")
         : fs.existsSync(path.join(dir, "title.txt")) ? path.join(dir, "title.txt")
         : null;
@@ -208,52 +157,31 @@ app.get("/spotlight-videos", (_req, res) => {
       const title = titlePath ? readTxt(titlePath) : name;
       const url   = linkPath ? readTxt(linkPath) : "";
 
-      // prefer files starting with "spotlight", fall back to the first image
       const files = fs.readdirSync(dir);
       const imgsPref = files.filter(f => /^spotlight.*\.(jpe?g|png|webp|gif)$/i.test(f));
       const imgsAny  = files.filter(isImg);
       const imgFile  = imgsPref[0] || imgsAny[0] || null;
 
-      if (!imgFile || !url) {
-        // Skip incomplete spotlight folders
-        continue;
-      }
+      if (!imgFile || !url) continue; // skip incomplete folders
 
       const imgAbs = path.join(dir, imgFile);
-      const mtime  = fs.statSync(imgAbs).mtimeMs || fs.statSync(dir).mtimeMs;
+      const mtime  = (fs.statSync(imgAbs).mtimeMs || fs.statSync(dir).mtimeMs) || Date.now();
 
       items.push({
         id: name,
         title,
         url,
-        thumb: urlFor(imgAbs),   // served via /static (we mounted DATA_ROOT there)
+        thumb: urlFor(imgAbs), // served via /static mount
         date: new Date(mtime).toISOString(),
       });
     }
 
-    // newest first
     items.sort((a, b) => (b.date || "").localeCompare(a.date || ""));
     res.json(items);
   } catch (err) {
     console.error("[/spotlight-videos]", err);
     res.status(500).json({ error: err.message });
   }
-});
-
-
-
-app.post("/admin/links", requireAdmin, (req, res) => {
-  if (!Array.isArray(req.body)) return res.status(400).json({ error: "Body must be an array of {label,url}" });
-  writeJson(path.join(DATA_ROOT, "app/links.json"), req.body);
-  res.json({ ok: true, count: req.body.length });
-});
-app.post("/admin/spotlights", requireAdmin, async (req, res) => {
-  if (!Array.isArray(req.body)) return res.status(400).json({ error: "Body must be an array" });
-  writeJson(path.join(DATA_ROOT, "app/spotlights.json"), req.body);
-  if (SPOTLIGHT_CHANNEL_ID) {
-    try { const ch = await discordClient.channels.fetch(SPOTLIGHT_CHANNEL_ID); if (ch) await ch.send("✅ Spotlights updated"); } catch {}
-  }
-  res.json({ ok: true, count: req.body.length });
 });
 
 // ---------- CONFESSIONS ----------
