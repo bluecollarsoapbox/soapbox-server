@@ -127,13 +127,12 @@ app.get("/health", (_req, res) => res.json({ ok: true, time: new Date().toISOStr
 app.get("/links", (_req, res) => res.json(safeReadJson(path.join(DATA_ROOT, "app/links.json"), [])));
 app.get("/spotlights", (_req, res) => res.json(safeReadJson(path.join(DATA_ROOT, "app/spotlights.json"), [])));
 
-// ---------- SPOTLIGHTS (FOLDER-BASED LIST THE APP USES) ----------
+// ---------- SPOTLIGHTS (FOLDER-BASED LIST) ----------
 // Reads: DATA_ROOT/Spotlights/<Folder>/
 // Files per spotlight folder (case-insensitive OK):
 //   - title or title.txt     (plain text)
 //   - link  or link.txt      (plain text full URL)
 //   - any image (jpg/jpeg/png/webp/gif) → thumbnail
-const IMAGE_EXTS = [".jpg", ".jpeg", ".png", ".webp", ".gif"];
 app.get("/spotlight-videos", (_req, res) => {
   try {
     const spotRoot = path.join(DATA_ROOT, "Spotlights");
