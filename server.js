@@ -170,7 +170,7 @@ app.get("/spotlight-videos", (_req, res) => {
         id: name,
         title,
         url,
-        thumb: urlFor(imgAbs), // served via /static mount
+        thumb: urlFor(imgAbs),
         date: new Date(mtime).toISOString(),
       });
     }
