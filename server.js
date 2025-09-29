@@ -144,7 +144,9 @@ async function postBreakingNewsCard(story) {
   if (!BREAKING_NEWS_CHANNEL_ID && !VOICEMAIL_CHANNEL_ID) {
     throw new Error("No BREAKING_NEWS_CHANNEL_ID or VOICEMAIL_CHANNEL_ID configured.");
   }
-  const channelId = BREAKING_NEWS_CHANNEL_ID || VOICEMAIL_CHANNEL_ID;
+  if (!BREAKING_NEWS_CHANNEL_ID) throw new Error("BREAKING_NEWS_CHANNEL_ID is not set");
+const channelId = BREAKING_NEWS_CHANNEL_ID;
+
   const ch = await discordClient.channels.fetch(channelId);
   if (!ch) throw new Error("Discord channel not found");
 
@@ -372,7 +374,9 @@ app.post("/story/:id/witness", upload.single("video"), async (req, res) => {
 
     // Post to Discord (breaking-news or voicemail fallback)
     try {
-      const channelId = BREAKING_NEWS_CHANNEL_ID || VOICEMAIL_CHANNEL_ID;
+      if (!BREAKING_NEWS_CHANNEL_ID) throw new Error("BREAKING_NEWS_CHANNEL_ID is not set");
+const channelId = BREAKING_NEWS_CHANNEL_ID;
+
       if (channelId) {
         const ch = await discordClient.channels.fetch(channelId);
         if (ch) await ch.send({ content: `🎥 Witness submission — **${storyId}**`, files: [new AttachmentBuilder(outPath)] });
