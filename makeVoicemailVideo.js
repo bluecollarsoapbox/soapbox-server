@@ -1,46 +1,81 @@
-// makeVoicemailVideo.js — uses the bundled ffmpeg-static binary
-const { spawn } = require("child_process");
-const ffmpegPath = require("ffmpeg-static"); // <- no system install needed
+// makeVoicemailVideo.js
+// Build a Discord-friendly MP4 (H.264/AAC) from an MP3 + optional thumbnail.
+// - If thumb provided & exists: loop that image as video
+// - Else: synthetic black background at 1280x720
+// Output: faststart MP4, yuv420p, ends with audio (shortest)
 
-function run(cmd, args) {
+const fs = require("fs");
+const path = require("path");
+const ffmpegPath = require("@ffmpeg-installer/ffmpeg").path;
+const ffmpeg = require("fluent-ffmpeg");
+ffmpeg.setFfmpegPath(ffmpegPath);
+
+/**
+ * @param {string} mp3Abs absolute path to source MP3
+ * @param {string} mp4Abs absolute path to target MP4
+ * @param {string|undefined} thumbAbs absolute path to thumbnail image (optional)
+ * @returns {Promise<void>}
+ */
+module.exports = function makeVoicemailVideo(mp3Abs, mp4Abs, thumbAbs) {
   return new Promise((resolve, reject) => {
-    const p = spawn(cmd, args, { stdio: ["ignore", "inherit", "inherit"] });
-    p.on("error", reject);
-    p.on("close", (code) => (code === 0 ? resolve() : reject(new Error(cmd + " exited " + code))));
+    try {
+      if (!mp3Abs || !fs.existsSync(mp3Abs)) {
+        return reject(new Error("Audio file not found: " + mp3Abs));
+      }
+      // ensure output dir exists
+      const outDir = path.dirname(mp4Abs);
+      if (!fs.existsSync(outDir)) fs.mkdirSync(outDir, { recursive: true });
+
+      const haveThumb = !!thumbAbs && fs.existsSync(thumbAbs);
+
+      // Build command
+      const cmd = ffmpeg();
+
+      if (haveThumb) {
+        // Use the image as a looping video layer
+        cmd.input(thumbAbs).inputOptions(["-loop 1"]);
+      } else {
+        // Use a synthetic black background if no image
+        cmd
+          .input("color=c=black:s=1280x720:d=36000")
+          .inputOptions(["-f lavfi"]);
+      }
+
+      // Add audio
+      cmd.input(mp3Abs);
+
+      // Scale/pad (only meaningful if we had an image; harmless on black)
+      // Ensure 1280x720 letterbox, preserve aspect
+      cmd.videoFilters([
+        "scale=1280:-2",
+        "pad=1280:720:(ow-iw)/2:(oh-ih)/2"
+      ]);
+
+      cmd
+        .outputOptions([
+          "-c:v libx264",
+          "-tune stillimage",    // good for static images
+          "-pix_fmt yuv420p",    // Discord/mobile compatibility
+          "-c:a aac",
+          "-b:a 128k",
+          "-movflags +faststart",
+          "-shortest"            // stop when audio ends
+        ])
+        .on("start", (cli) => {
+          console.log("[ffmpeg] start:", cli);
+        })
+        .on("error", (err, stdout, stderr) => {
+          console.error("[ffmpeg] error:", err?.message || err);
+          if (stderr) console.error(stderr);
+          reject(err);
+        })
+        .on("end", () => {
+          console.log("[ffmpeg] done:", mp4Abs);
+          resolve();
+        })
+        .save(mp4Abs);
+    } catch (e) {
+      reject(e);
+    }
   });
-}
-
-async function makeVoicemailVideo(mp3Path, mp4Out, imagePath) {
-  const hasImage = !!imagePath;
-  const vf = hasImage
-    ? [
-        "scale='min(1280,iw)':'min(720,ih)':force_original_aspect_ratio=decrease",
-        "pad=1280:720:(1280-iw)/2:(720-ih)/2:color=black",
-        "format=yuv420p"
-      ].join(",")
-    : "color=c=black:s=1280x720,format=yuv420p";
-
-  const inputs = hasImage
-    ? ["-loop", "1", "-i", imagePath, "-i", mp3Path]
-    : ["-f", "lavfi", "-i", "color=c=black:s=1280x720", "-i", mp3Path];
-
-  const args = [
-    ...inputs,
-    "-shortest",
-    "-r", "30",
-    "-c:v", "libx264",
-    "-profile:v", "baseline",
-    "-level", "3.0",
-    "-pix_fmt", "yuv420p",
-    "-vf", vf,
-    "-c:a", "aac",
-    "-b:a", "128k",
-    "-movflags", "+faststart",
-    "-y",
-    mp4Out
-  ];
-
-  await run(ffmpegPath, args);
-}
-
-module.exports = makeVoicemailVideo;
+};
