@@ -437,7 +437,9 @@ app.post("/admin/publish-stories", requireAdmin, async (req, res) => {
     }
 
     const active = stories.filter(s => s.active);
-    const listToPost = active.length ? active : stories; // if none active, post all
+    // after `const active = stories.filter(s => s.active);`
+const forceAll = !!(req.body && req.body.all);
+const listToPost = forceAll ? stories : (active.length ? active : stories)
 
     for (const s of listToPost) {
       await publishStoryToChannel(s, channelId);
