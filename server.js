@@ -21,14 +21,17 @@ try { makeVoicemailVideo = require("./makeVoicemailVideo"); } catch (_) {}
 
 // ---------- CONFIG ----------
 const DATA_ROOT = process.env.DATA_DIR || process.env.DATA_ROOT || "/opt/render/project/data";
-const ADMIN_KEY = process.env.SOAPBOX_API_KEY || "changeme";
+const ADMIN_KEY  = process.env.SOAPBOX_API_KEY || "changeme";
 
 // Discord envs
 const DISCORD_TOKEN            = process.env.DISCORD_TOKEN || "";
 const CONFESSIONS_CHANNEL_ID   = process.env.CONFESSIONS_CHANNEL_ID || "";
 const SPOTLIGHT_CHANNEL_ID     = process.env.SPOTLIGHT_CHANNEL_ID || "";
 const VOICEMAIL_CHANNEL_ID     = process.env.VOICEMAIL_CHANNEL_ID || "";
-const BREAKING_NEWS_CHANNEL_ID = process.env.BREAKING_NEWS_CHANNEL_ID || ""; // Forum channel preferred
+const BREAKING_NEWS_CHANNEL_ID = process.env.BREAKING_NEWS_CHANNEL_ID || ""; // forum channel preferred
+
+// Absolute origin for embed images
+const PUBLIC_BASE = process.env.PUBLIC_BASE || "https://soapbox-server.onrender.com";
 
 // ---------- DISCORD ----------
 const discordClient = new Client({
@@ -504,14 +507,18 @@ function resolveStoryAssets(storyId) {
   const dir = storyDirOf(storyId);
   const meta = readStoryMeta(storyId);
   const title = (meta.title || storyId).toString();
-  const sub = (meta.subtitle || "").toString();
+  const sub   = (meta.subtitle || "").toString();
 
-  const thumbRel = meta.thumbnailYt || meta.youtubeThumbnail || meta.thumbnail || null;
+  const thumbRel  = meta.thumbnailYt || meta.youtubeThumbnail || meta.thumbnail || null;
   const thumbFile = thumbRel ? path.join(dir, thumbRel) : null;
 
-  // Prefer MP3 only (reliable inline audio player). If you later want MP4, switch here.
+  // Prefer MP4 (if pre-rendered), else MP3 from legacy voicemail folder
   const vmMp3 = findVoicemailPath(storyId);
-  const mediaFile = (vmMp3 && fs.existsSync(vmMp3)) ? vmMp3 : null;
+  let mediaFile = null;
+  if (vmMp3 && fs.existsSync(vmMp3)) {
+    const mp4Guess = path.join(dir, path.basename(vmMp3).replace(/\.[^.]+$/, "") + ".mp4");
+    mediaFile = fs.existsSync(mp4Guess) ? mp4Guess : vmMp3;
+  }
 
   return {
     title,
@@ -521,25 +528,23 @@ function resolveStoryAssets(storyId) {
   };
 }
 
-async function ensureForumThread(channelId, storyId, titleText, messageContent, files) {
+async function ensureForumThread(channelId, storyId, titleText, messageContent, files, embeds) {
   const ch = await discordClient.channels.fetch(channelId);
   if (!ch) throw new Error("Breaking News channel not found");
   if (ch.type === ChannelType.GuildForum) {
-    const created = await ch.threads.create({
+    return ch.threads.create({
       name: titleText,
-      message: { content: messageContent, files }
+      message: { content: messageContent, files, embeds }
     });
-    return created;
   } else {
-    const msg = await ch.send({ content: messageContent, files });
-    return msg;
+    return ch.send({ content: messageContent, files, embeds });
   }
 }
 
-async function postToExistingThread(threadId, content, files) {
+async function postToExistingThread(threadId, content, files, embeds) {
   const thread = await discordClient.channels.fetch(threadId);
   if (!thread) throw new Error("Thread not found");
-  return thread.send({ content, files });
+  return thread.send({ content, files, embeds });
 }
 
 async function publishStoryOnce(storyId, channelIdOverride) {
@@ -550,15 +555,19 @@ async function publishStoryOnce(storyId, channelIdOverride) {
 
   const { title, sub, thumbFile, mediaFile } = resolveStoryAssets(storyId);
 
-  const headline = title?.trim() || storyId;
-  const subline = sub?.trim() || "";
-  const content = subline ? `**${headline}**\n${subline}` : `**${headline}**`;
+  const headline = (title || storyId).trim();
+  const subline  = (sub || "").trim();
+  const content  = subline ? `**${headline}**\n${subline}` : `**${headline}**`;
 
+  // ONE media file only (MP4 or MP3) to avoid duplicate-render issues
   const files = [];
-  if (mediaFile) {
-    files.push(new AttachmentBuilder(mediaFile)); // MP3 only
-  } else if (thumbFile) {
-    files.push(new AttachmentBuilder(thumbFile)); // only if no media
+  if (mediaFile) files.push(new AttachmentBuilder(mediaFile));
+
+  // Thumbnail shown via embed image (not as a second attachment)
+  const embeds = [];
+  if (thumbFile) {
+    const thumbUrl = PUBLIC_BASE + urlFor(thumbFile);
+    embeds.push({ image: { url: thumbUrl } });
   }
 
   const map = readThreadMap();
@@ -568,9 +577,9 @@ async function publishStoryOnce(storyId, channelIdOverride) {
   if (!targetChannelId) throw new Error("BREAKING_NEWS_CHANNEL_ID not set and no override provided");
 
   if (mappedThread) {
-    return await postToExistingThread(mappedThread, content, files);
+    return await postToExistingThread(mappedThread, content, files, embeds);
   } else {
-    return await ensureForumThread(targetChannelId, storyId, headline, content, files);
+    return await ensureForumThread(targetChannelId, storyId, headline, content, files, embeds);
   }
 }
 
