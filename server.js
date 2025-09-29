@@ -1,7 +1,9 @@
-// SOAPBOX SERVER — Render disk + legacy voicemail-folder behavior + Discord publishing
-// Source of truth on Render disk: /opt/render/project/data
-// If Stories/<id>/voicemail/ has a single .mp3, use it. Otherwise:
-//   1) metadata.voicemail  2) Stories/<id>/voicemail.mp3
+// SOAPBOX SERVER — Render disk + legacy voicemail-folder behavior + Forum posting
+// Disk root: /opt/render/project/data  (override with DATA_DIR or DATA_ROOT)
+// Story voicemail search order:
+//   1) Stories/<id>/voicemail/<first .mp3>   (legacy folder)
+//   2) metadata.voicemail                    (exact filename in story root)
+//   3) Stories/<id>/voicemail.mp3
 
 const express = require("express");
 const cors = require("cors");
@@ -9,32 +11,29 @@ const multer = require("multer");
 const fs = require("fs");
 const path = require("path");
 const archiver = require("archiver");
-const { Client, GatewayIntentBits, AttachmentBuilder } = require("discord.js");
+const { Client, GatewayIntentBits, AttachmentBuilder, ChannelType } = require("discord.js");
 
+// Optional custom poster that knows your threading/format rules
 let externalPoster = null;
-try { externalPoster = require("./discordPoster"); } catch (_) {}
+try { externalPoster = require("./discordPoster"); } catch {}
 
-const makeVoicemailVideo = require("./makeVoicemailVideo");
-
-// ---------- CONFIG ----------
+/* =========================
+   CONFIG
+   ========================= */
 const DATA_ROOT = process.env.DATA_DIR || process.env.DATA_ROOT || "/opt/render/project/data";
-const ADMIN_KEY  = process.env.SOAPBOX_API_KEY || "changeme";
+const ADMIN_KEY = process.env.SOAPBOX_API_KEY || "changeme";
 
-const DISCORD_TOKEN          = process.env.DISCORD_TOKEN || "";
-const CONFESSIONS_CHANNEL_ID = process.env.CONFESSIONS_CHANNEL_ID || "";
-const SPOTLIGHT_CHANNEL_ID   = process.env.SPOTLIGHT_CHANNEL_ID   || "";
-const VOICEMAIL_CHANNEL_ID   = process.env.VOICEMAIL_CHANNEL_ID   || "";
+const DISCORD_TOKEN = process.env.DISCORD_TOKEN || "";
 
-// Accept multiple env names for breaking news to be bulletproof
-const BREAKING_NEWS_CHANNEL_ID =
-  process.env.BREAKING_NEWS_CHANNEL_ID ||
-  process.env.BREAKING_CHANNEL_ID ||
-  process.env.NEWS_CHANNEL_ID ||
-  process.env.BREAKING ||
-  process.env.NEWS ||
-  "";
+// Channel IDs — fallbacks use what you provided
+const BREAKING_NEWS_CHANNEL_ID = process.env.BREAKING_NEWS_CHANNEL_ID || "1407176815285637313";
+const CONFESSIONS_CHANNEL_ID   = process.env.CONFESSIONS_CHANNEL_ID   || "1407177292605685932";
+const VOICEMAIL_CHANNEL_ID     = process.env.VOICEMAIL_CHANNEL_ID     || "1407177470997696562";
+const SPOTLIGHT_CHANNEL_ID     = process.env.SPOTLIGHT_CHANNEL_ID     || "1411392998427856907";
 
-// ---------- DISCORD ----------
+/* =========================
+   DISCORD
+   ========================= */
 const discordClient = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages] });
 if (DISCORD_TOKEN) {
   discordClient.login(DISCORD_TOKEN)
@@ -44,12 +43,14 @@ if (DISCORD_TOKEN) {
   console.warn("[Discord] No DISCORD_TOKEN set");
 }
 
-// ---------- APP ----------
+/* =========================
+   APP
+   ========================= */
 const app = express();
 app.use(cors());
 app.use(express.json({ limit: "25mb" }));
 
-// Serve the entire Render disk as /static
+// Serve the entire disk under /static
 app.use("/static", express.static(DATA_ROOT, {
   fallthrough: true,
   setHeaders(res) { res.setHeader("Access-Control-Allow-Origin", "*"); }
@@ -57,7 +58,9 @@ app.use("/static", express.static(DATA_ROOT, {
 
 const upload = multer({ dest: path.join(DATA_ROOT, "tmp") });
 
-// ---------- HELPERS ----------
+/* =========================
+   HELPERS
+   ========================= */
 function ensureDir(p) { if (!fs.existsSync(p)) fs.mkdirSync(p, { recursive: true }); }
 function safeReadJson(file, fallback) {
   try { if (!fs.existsSync(file)) return fallback; return JSON.parse(fs.readFileSync(file, "utf8")); }
@@ -77,14 +80,14 @@ function readStoryMeta(id) {
   return safeReadJson(path.join(DATA_ROOT, "Stories", id, "metadata.json"), { id });
 }
 
-// ---- LEGACY: find voicemail MP3 like it used to ----
+// Legacy voicemail resolution
 function findVoicemailPath(storyId) {
   const dir = storyDirOf(storyId);
-  // 1) Folder “voicemail” with one .mp3 (or at least one — pick first)
+  // 1) voicemail folder
   const vmFolder = path.join(dir, "voicemail");
   if (fs.existsSync(vmFolder) && fs.statSync(vmFolder).isDirectory()) {
     const mp3s = (fs.readdirSync(vmFolder) || []).filter(f => /\.mp3$/i.test(f));
-    if (mp3s.length >= 1) return path.join(vmFolder, mp3s[0]); // first mp3
+    if (mp3s.length >= 1) return path.join(vmFolder, mp3s[0]);
   }
   // 2) metadata.voicemail
   const meta = readStoryMeta(storyId);
@@ -92,29 +95,52 @@ function findVoicemailPath(storyId) {
     const abs = path.join(dir, meta.voicemail.trim());
     if (fs.existsSync(abs)) return abs;
   }
-  // 3) default file in story root
+  // 3) default file
   const fallback = path.join(dir, "voicemail.mp3");
   if (fs.existsSync(fallback)) return fallback;
-
   return null;
 }
 
-async function postFileToDiscord(storyId, absFilePath, content = "") {
-  // Prefer your existing poster (keeps thread routing, formatting)
+// Publish one story card to a Text or Forum channel
+async function publishStoryToChannel(channelId, story) {
+  if (!channelId) throw new Error("No channelId provided");
+  const ch = await discordClient.channels.fetch(channelId);
+  if (!ch) throw new Error("Discord channel not found");
+
+  const lines = [];
+  lines.push(`**${story.title || story.headline || story.id}**`);
+  if (story.subtitle) lines.push(story.subtitle);
+  if (story.voicemailUrl) lines.push(`🎧 Voicemail: ${story.voicemailUrl}`);
+  const content = lines.join("\n");
+
+  // Let your custom poster try first
   if (externalPoster && typeof externalPoster === "function") {
-    try { return await externalPoster(discordClient, storyId, absFilePath, content); }
+    try { await externalPoster(discordClient, story.id, null, content); return; }
     catch (e) { console.warn("[DiscordPoster] external poster failed, falling back:", e.message); }
   }
-  if (!VOICEMAIL_CHANNEL_ID) throw new Error("No VOICEMAIL_CHANNEL_ID set and external poster unavailable.");
-  const ch = await discordClient.channels.fetch(VOICEMAIL_CHANNEL_ID);
-  if (!ch) throw new Error("Discord channel not found");
-  const file = new AttachmentBuilder(absFilePath);
-  return ch.send({ content, files: [file] });
+
+  // Text channel
+  if (typeof ch.send === "function") {
+    await ch.send({ content, ...(story.thumbUrl ? { files: [story.thumbUrl] } : {}) });
+    return;
+  }
+
+  // Forum: create a post with first message
+  if (ch.type === ChannelType.GuildForum && ch.threads && typeof ch.threads.create === "function") {
+    await ch.threads.create({
+      name: story.title || story.id,
+      message: { content, ...(story.thumbUrl ? { files: [story.thumbUrl] } : {}) },
+    });
+    return;
+  }
+
+  throw new Error("Unsupported channel type (no send/threads.create)");
 }
 
-// ---------- STATIC ALIASES THE APP EXPECTS ----------
-// Express 5’s path-to-regexp is strict; avoid the old `:rest*` pattern.
-// Use a RegExp route to map /static/<id>/<rest> to the story folder:
+/* =========================
+   STATIC ALIASES APP EXPECTS
+   ========================= */
+// Express 5: avoid :rest* pattern; use regex mapping /static/<id>/<rest>
 app.get(/^\/static\/([^/]+)\/(.+)$/, (req, res, next) => {
   const storyId = req.params[0];
   const restRel = req.params[1];
@@ -129,50 +155,58 @@ app.get("/static/:storyId/metadata.json", (req, res) => {
   res.type("application/json").send(fs.readFileSync(file, "utf8"));
 });
 
-// ---------- HEALTH ----------
+/* =========================
+   HEALTH
+   ========================= */
 app.get("/health", (_req, res) => res.json({ ok: true, time: new Date().toISOString() }));
 
-// ---------- LINKS / SPOTLIGHTS ----------
-app.get("/links", (_req, res) => res.json(safeReadJson(path.join(DATA_ROOT, "app/links.json"), [])));
-app.get("/spotlights", (_req, res) => res.json(safeReadJson(path.join(DATA_ROOT, "app/spotlights.json"), [])));
-
-app.post("/spotlights", async (req, res) => {
-  // Spotlight form → post to Spotlight channel
-  try {
-    const { name, link, notes } = req.body || {};
-    if (!name || !link) return res.status(400).json({ error: "Missing name or link" });
-    if (!SPOTLIGHT_CHANNEL_ID) return res.status(500).json({ error: "SPOTLIGHT_CHANNEL_ID not set" });
-    const ch = await discordClient.channels.fetch(SPOTLIGHT_CHANNEL_ID);
-    if (!ch) return res.status(500).json({ error: "Discord channel not found" });
-    const lines = [
-      "⭐ **New Spotlight Submission**",
-      `Name: ${name}`,
-      `Link: ${link}`,
-      notes ? `Notes: ${notes}` : null
-    ].filter(Boolean);
-    await ch.send({ content: lines.join("\n") });
-    res.json({ ok: true });
-  } catch (e) {
-    console.error(e);
-    res.status(500).json({ error: e.message });
-  }
+/* =========================
+   LINKS / SPOTLIGHTS
+   ========================= */
+app.get("/links", (_req, res) => {
+  // server stores {items:[{title,url,imageKey? or imageUrl?}]}
+  res.json(safeReadJson(path.join(DATA_ROOT, "app/links.json"), { items: [] }));
 });
 
 app.post("/admin/links", requireAdmin, (req, res) => {
-  if (!Array.isArray(req.body)) return res.status(400).json({ error: "Body must be an array of {label/url or title/url}" });
+  if (!req.body || typeof req.body !== "object") return res.status(400).json({ error: "Body must be an object" });
   writeJson(path.join(DATA_ROOT, "app/links.json"), req.body);
-  res.json({ ok: true, count: req.body.length });
-});
-app.post("/admin/spotlights", requireAdmin, async (req, res) => {
-  if (!Array.isArray(req.body)) return res.status(400).json({ error: "Body must be an array" });
-  writeJson(path.join(DATA_ROOT, "app/spotlights.json"), req.body);
-  if (SPOTLIGHT_CHANNEL_ID) {
-    try { const ch = await discordClient.channels.fetch(SPOTLIGHT_CHANNEL_ID); if (ch) await ch.send("✅ Spotlights updated"); } catch {}
-  }
-  res.json({ ok: true, count: req.body.length });
+  res.json({ ok: true });
 });
 
-// ---------- CONFESSIONS ----------
+// Spotlights are folders: Spotlights/<Name>/{title.txt,link.txt,<image>}
+function readSpotlights() {
+  const root = path.join(DATA_ROOT, "Spotlights");
+  const out = [];
+  if (!fs.existsSync(root)) return out;
+  for (const id of fs.readdirSync(root)) {
+    const dir = path.join(root, id);
+    try {
+      const st = fs.statSync(dir);
+      if (!st.isDirectory()) continue;
+      const titleFile = path.join(dir, "title.txt");
+      const linkFile  = path.join(dir, "link.txt");
+      if (!fs.existsSync(titleFile) || !fs.existsSync(linkFile)) continue;
+
+      const title = fs.readFileSync(titleFile, "utf8").trim();
+      const url   = fs.readFileSync(linkFile, "utf8").trim();
+
+      const img = (fs.readdirSync(dir).find(f => /\.(png|jpe?g|webp)$/i.test(f)) || null);
+      const thumb = img ? `/static/Spotlights/${encodeURIComponent(id)}/${encodeURIComponent(img)}` : null;
+
+      out.push({ id, title, url, thumb, date: new Date(st.mtimeMs).toISOString() });
+    } catch {}
+  }
+  // newest first
+  out.sort((a, b) => (b.date || "").localeCompare(a.date || ""));
+  return out;
+}
+
+app.get("/spotlight-videos", (_req, res) => res.json(readSpotlights()));
+
+/* =========================
+   CONFESSIONS
+   ========================= */
 app.get("/confessions", (_req, res) => res.json(safeReadJson(path.join(DATA_ROOT, "app/confessions.json"), [])));
 
 app.post("/confessions", async (req, res) => {
@@ -181,13 +215,19 @@ app.post("/confessions", async (req, res) => {
   const file = path.join(DATA_ROOT, "app/confessions.json");
   const arr = safeReadJson(file, []); arr.push({ text, at: new Date().toISOString() });
   writeJson(file, arr);
+
   if (CONFESSIONS_CHANNEL_ID) {
-    try { const ch = await discordClient.channels.fetch(CONFESSIONS_CHANNEL_ID); if (ch) await ch.send(text); } catch {}
+    try {
+      const ch = await discordClient.channels.fetch(CONFESSIONS_CHANNEL_ID);
+      if (ch && typeof ch.send === "function") await ch.send(text);
+    } catch (e) { console.warn("[Confessions] post failed:", e.message); }
   }
   res.json({ ok: true });
 });
 
-// ---------- STORIES (LIST) ----------
+/* =========================
+   STORIES (LIST)
+   ========================= */
 app.get("/stories", (_req, res) => {
   try {
     const root = path.join(DATA_ROOT, "Stories");
@@ -196,24 +236,24 @@ app.get("/stories", (_req, res) => {
     for (const id of fs.readdirSync(root)) {
       const dir = path.join(root, id);
       const metaFile = path.join(dir, "metadata.json");
-      if (fs.existsSync(dir) && fs.existsSync(metaFile)) {
-        const meta = safeReadJson(metaFile, {});
-        const thumbRel = meta.thumbnailYt || meta.youtubeThumbnail || meta.thumbnail || null;
-        const thumbUrl = thumbRel ? `/static/Stories/${id}/${thumbRel}` : null;
+      if (!fs.existsSync(dir) || !fs.existsSync(metaFile)) continue;
 
-        const vmAbs = findVoicemailPath(id);
-        const voicemailUrl = vmAbs ? urlFor(vmAbs) : null;
+      const meta = safeReadJson(metaFile, {});
+      const thumbRel = meta.thumbnailYt || meta.youtubeThumbnail || meta.thumbnail || null;
+      const thumbUrl = thumbRel ? `/static/Stories/${encodeURIComponent(id)}/${encodeURIComponent(thumbRel)}` : null;
 
-        out.push({
-          id,
-          title: meta.title || meta.headline || id,
-          subtitle: meta.subtitle || "",
-          active: !!meta.active,
-          prompts: Array.isArray(meta.prompts) ? meta.prompts : [],
-          thumbUrl,
-          voicemailUrl
-        });
-      }
+      const vmAbs = findVoicemailPath(id);
+      const voicemailUrl = vmAbs ? urlFor(vmAbs) : null;
+
+      out.push({
+        id,
+        title: meta.title || id,
+        subtitle: meta.subtitle || "",
+        active: !!meta.active,
+        prompts: Array.isArray(meta.prompts) ? meta.prompts : [],
+        thumbUrl,
+        voicemailUrl
+      });
     }
     res.json(out);
   } catch (err) {
@@ -221,14 +261,18 @@ app.get("/stories", (_req, res) => {
   }
 });
 
-// ---------- VOICEMAIL (APP AUTOPLAY) ----------
+/* =========================
+   VOICEMAIL (APP AUTOPLAY)
+   ========================= */
 app.get("/voicemail/:id", (req, res) => {
   const vmAbs = findVoicemailPath(req.params.id);
   if (!vmAbs) return res.status(404).json({ error: "No voicemail for this story" });
   res.redirect(302, urlFor(vmAbs));
 });
 
-// ---------- ADMIN: STORY META & THUMBS ----------
+/* =========================
+   ADMIN: STORY META & THUMBS
+   ========================= */
 app.post("/admin/story/:id/meta", requireAdmin, (req, res) => {
   try {
     const id = req.params.id;
@@ -239,10 +283,10 @@ app.post("/admin/story/:id/meta", requireAdmin, (req, res) => {
     if (typeof req.body.title === "string") next.title = req.body.title;
     if (typeof req.body.subtitle === "string") next.subtitle = req.body.subtitle;
     if (Array.isArray(req.body.prompts)) next.prompts = req.body.prompts;
-    if (typeof req.body.voicemail === "string") next.voicemail = req.body.voicemail; // optional override
+    if (typeof req.body.voicemail === "string") next.voicemail = req.body.voicemail;
 
-    // Handle active flag with one-active-at-a-time rule
     if (typeof req.body.active === "boolean" && req.body.active) {
+      // make this the only active
       const root = path.join(DATA_ROOT, "Stories");
       if (fs.existsSync(root)) {
         for (const otherId of fs.readdirSync(root)) {
@@ -255,11 +299,8 @@ app.post("/admin/story/:id/meta", requireAdmin, (req, res) => {
         }
       }
       next.active = true;
-      // refresh stories.json snapshot used by publisher
-      writeStoriesSnapshot();
     } else if (typeof req.body.active === "boolean") {
       next.active = req.body.active;
-      writeStoriesSnapshot();
     }
 
     writeJson(file, next);
@@ -280,7 +321,6 @@ app.post("/admin/story/:id/thumbnail", requireAdmin, upload.single("file"), (req
     const meta = safeReadJson(metaFile, { id });
     meta.thumbnail = filename;
     writeJson(metaFile, meta);
-    writeStoriesSnapshot();
 
     res.json({ ok: true, thumbnail: urlFor(dest) });
   } catch (e) { res.status(500).json({ error: e.message }); }
@@ -299,36 +339,51 @@ app.post("/admin/story/:id/thumbnail-yt", requireAdmin, upload.single("file"), (
     const meta = safeReadJson(metaFile, { id });
     meta.thumbnailYt = filename;
     writeJson(metaFile, meta);
-    writeStoriesSnapshot();
 
     res.json({ ok: true, thumbnailYt: urlFor(dest) });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// ---------- ADMIN: VOICEMAIL (per story) ----------
+/* =========================
+   ADMIN: VOICEMAIL UPLOAD (per story)
+   ========================= */
 app.post("/admin/story/:id/voicemail", requireAdmin, upload.single("audio"), async (req, res) => {
   try {
     const storyId = req.params.id;
     if (!req.file) return res.status(400).json({ error: "Missing audio" });
 
     const dir = storyDirOf(storyId); ensureDir(dir);
-    // Put new mp3 in the voicemail folder (legacy style)
     const vmFolder = path.join(dir, "voicemail"); ensureDir(vmFolder);
-    // Clean out old mp3s in that folder
-    try { for (const f of fs.readdirSync(vmFolder)) if (/\.mp3$/i.test(f)) fs.unlinkSync(path.join(vmFolder, f)); } catch {}
+
+    // Clean old mp3s
+    try {
+      for (const f of fs.readdirSync(vmFolder)) if (/\.mp3$/i.test(f)) fs.unlinkSync(path.join(vmFolder, f));
+    } catch {}
+
     const mp3Name = (req.file.originalname && /\.mp3$/i.test(req.file.originalname)) ? req.file.originalname : "voicemail.mp3";
     const mp3Path = path.join(vmFolder, mp3Name);
     fs.renameSync(req.file.path, mp3Path);
 
+    // (Optional) build an mp4 teaser
+    const makeVoicemailVideo = require("./makeVoicemailVideo");
     const meta = readStoryMeta(storyId);
     const ytThumbRel = meta.thumbnailYt || meta.youtubeThumbnail || null;
     const ytThumbAbs = ytThumbRel ? path.join(dir, ytThumbRel) : null;
-
     const mp4Path = path.join(dir, (mp3Name.replace(/\.[^.]+$/, "") || "voicemail") + ".mp4");
     await makeVoicemailVideo(mp3Path, mp4Path, ytThumbAbs && fs.existsSync(ytThumbAbs) ? ytThumbAbs : undefined);
 
-    await postFileToDiscord(storyId, mp4Path, `📣 Voicemail for **${storyId}**`);
-    writeStoriesSnapshot();
+    // Fallback post if externalPoster not available
+    try {
+      await publishStoryToChannel(VOICEMAIL_CHANNEL_ID, {
+        id: storyId,
+        title: `Voicemail for ${storyId}`,
+        subtitle: "",
+        thumbUrl: ytThumbAbs ? urlFor(ytThumbAbs) : null,
+        voicemailUrl: urlFor(mp3Path),
+      });
+    } catch (e) {
+      console.warn("[Voicemail fallback post] failed:", e.message);
+    }
 
     res.json({ ok: true, mp3: urlFor(mp3Path), mp4: urlFor(mp4Path) });
   } catch (err) {
@@ -337,7 +392,9 @@ app.post("/admin/story/:id/voicemail", requireAdmin, upload.single("audio"), asy
   }
 });
 
-// ---------- ADMIN: WITNESS (per story) ----------
+/* =========================
+   ADMIN: WITNESS (per story)
+   ========================= */
 app.post("/admin/story/:id/witness", requireAdmin, upload.single("video"), async (req, res) => {
   try {
     const storyId = req.params.id;
@@ -348,7 +405,15 @@ app.post("/admin/story/:id/witness", requireAdmin, upload.single("video"), async
     const outPath = path.join(wtDir, `${base}.mp4`);
     fs.renameSync(req.file.path, outPath);
 
-    await postFileToDiscord(storyId, outPath, `🎥 Witness submission — **${storyId}**`);
+    // post raw file into Breaking News thread/post
+    await publishStoryToChannel(BREAKING_NEWS_CHANNEL_ID, {
+      id: storyId,
+      title: `Witness Video — ${storyId}`,
+      subtitle: "",
+      thumbUrl: null,
+      voicemailUrl: null,
+    });
+
     res.json({ ok: true, url: urlFor(outPath) });
   } catch (err) {
     console.error(err);
@@ -356,37 +421,9 @@ app.post("/admin/story/:id/witness", requireAdmin, upload.single("video"), async
   }
 });
 
-// ---------- SNAPSHOT (for publisher) ----------
-function writeStoriesSnapshot() {
-  try {
-    const stories = [];
-    const root = path.join(DATA_ROOT, "Stories");
-    if (!fs.existsSync(root)) { writeJson(path.join(DATA_ROOT, "app/stories.json"), stories); return; }
-    for (const id of fs.readdirSync(root)) {
-      const dir = path.join(root, id);
-      const metaFile = path.join(dir, "metadata.json");
-      if (!fs.existsSync(metaFile)) continue;
-      const meta = safeReadJson(metaFile, {});
-      const thumbRel = meta.thumbnailYt || meta.youtubeThumbnail || meta.thumbnail || null;
-      const thumbUrl = thumbRel ? `/static/Stories/${id}/${thumbRel}` : null;
-      const vmAbs = findVoicemailPath(id);
-      const voicemailUrl = vmAbs ? urlFor(vmAbs) : null;
-      stories.push({
-        id,
-        title: meta.title || meta.headline || id,
-        subtitle: meta.subtitle || "",
-        active: !!meta.active,
-        thumbUrl,
-        voicemailUrl,
-      });
-    }
-    writeJson(path.join(DATA_ROOT, "app/stories.json"), stories);
-  } catch (e) {
-    console.warn("[Snapshot] Failed:", e.message);
-  }
-}
-
-// ---------- ADMIN: ROTATE STORIES ----------
+/* =========================
+   ADMIN: ROTATE STORIES
+   ========================= */
 function allStoryIds() {
   const root = path.join(DATA_ROOT, "Stories");
   if (!fs.existsSync(root)) return [];
@@ -405,7 +442,6 @@ function setActive(targetId) {
     writeMeta(id, m);
     if (m.active) activeMeta = m;
   });
-  writeStoriesSnapshot();
   return { activeId: targetId, meta: activeMeta, ids };
 }
 
@@ -422,7 +458,9 @@ app.post("/admin/rotate-stories", requireAdmin, (req, res) => {
   } catch (err) { res.status(400).json({ error: err.message }); }
 });
 
-// ---------- ADMIN: EXPORT (ZIP originals) ----------
+/* =========================
+   ADMIN: EXPORT (ZIP originals)
+   ========================= */
 app.get("/admin/export", requireAdmin, (req, res) => {
   try {
     const story = (req.query.story || "").trim();
@@ -457,8 +495,7 @@ app.get("/admin/export", requireAdmin, (req, res) => {
       const vmAbs = findVoicemailPath(id);
       if (vmAbs) archive.file(vmAbs, { name: `${id}/${path.basename(vmAbs)}` });
 
-      const baseName = path.basename(vmAbs || "voicemail.mp3").replace(/\.[^.]+$/, "");
-      const vmMp4 = path.join(dir, `${baseName}.mp4`);
+      const vmMp4 = path.join(dir, ((path.basename(vmAbs || "voicemail.mp3")).replace(/\.[^.]+$/, "") + ".mp4"));
       if (fs.existsSync(vmMp4)) archive.file(vmMp4, { name: `${id}/${path.basename(vmMp4)}` });
 
       const witDir = path.join(dir, "witnesses");
@@ -473,104 +510,79 @@ app.get("/admin/export", requireAdmin, (req, res) => {
   }
 });
 
-// ---------- OPTIONAL: DISCORD VOICEMAIL INBOX ----------
-app.post("/admin/discord/voicemail", requireAdmin, upload.single("audio"), async (req, res) => {
-  try {
-    if (!VOICEMAIL_CHANNEL_ID) return res.status(400).json({ error: "VOICEMAIL_CHANNEL_ID not set" });
-    if (!req.file) return res.status(400).json({ error: "Missing audio" });
-
-    const inboxDir = path.join(DATA_ROOT, "inbox", "discord-voicemails"); ensureDir(inboxDir);
-    const postedDir = path.join(DATA_ROOT, "posted", "discord-voicemails"); ensureDir(postedDir);
-
-    const base = Date.now().toString();
-    const mp3Path = path.join(inboxDir, `${base}.mp3`);
-    fs.renameSync(req.file.path, mp3Path);
-
-    const defaultThumb = path.join(DATA_ROOT, "app", "megaphone.png");
-    const mp4Path = path.join(inboxDir, `${base}.mp4`);
-    await makeVoicemailVideo(mp3Path, mp4Path, fs.existsSync(defaultThumb) ? defaultThumb : undefined);
-
-    const ch = await discordClient.channels.fetch(VOICEMAIL_CHANNEL_ID);
-    if (!ch) return res.status(500).json({ error: "Discord channel not found" });
-    await ch.send({ content: "📬 New voicemail", files: [new AttachmentBuilder(mp4Path)] });
-
-    fs.renameSync(mp3Path, path.join(postedDir, `${base}.mp3`));
-    fs.renameSync(mp4Path, path.join(postedDir, `${base}.mp4`));
-
-    res.json({ ok: true });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// ---------- PUBLISH TO BREAKING-NEWS ----------
-
-// Helper: publish one story card to a channel (simple text; adjust if you have a custom formatter)
-async function publishStoryToChannel(discordClient, channelId, story) {
-  if (!channelId) throw new Error("No channelId provided");
-  const ch = await discordClient.channels.fetch(channelId);
-  if (!ch) throw new Error("Discord channel not found");
-
-  const lines = [];
-  lines.push(`🧵 **${story.title || story.headline || story.id}**`);
-  if (story.subtitle) lines.push(story.subtitle);
-  if (story.voicemailUrl) lines.push(`▶️ Voicemail: ${story.voicemailUrl}`);
-  if (story.thumbUrl) lines.push(`🖼️ Thumb: ${story.thumbUrl}`);
-
-  await ch.send({ content: lines.join("\n") });
-}
-
-// POST /admin/publish-stories — publish ACTIVE story only
-// You can override the channel with JSON body: { "channelId": "1407176815..." }
+/* =========================
+   ADMIN: PUBLISH TO DISCORD
+   ========================= */
+// Active story only
 app.post("/admin/publish-stories", requireAdmin, async (req, res) => {
   try {
-    const overrideId = (req.body && (req.body.channelId || req.body.channel)) ? String(req.body.channelId || req.body.channel) : "";
-    const channelId = overrideId || BREAKING_NEWS_CHANNEL_ID;
-    if (!channelId) return res.status(400).json({ error: "Breaking news channel id not set" });
+    const channelId = (req.body && req.body.channelId) || BREAKING_NEWS_CHANNEL_ID;
+    const stories = safeReadJson(path.join(DATA_ROOT, "app/stories.json"), null) || (() => {
+      const out = [];
+      const root = path.join(DATA_ROOT, "Stories");
+      if (!fs.existsSync(root)) return out;
+      for (const id of fs.readdirSync(root)) {
+        const dir = path.join(root, id);
+        const meta = safeReadJson(path.join(dir, "metadata.json"), { id });
+        if (!meta.active) continue;
+        const thumbRel = meta.thumbnailYt || meta.youtubeThumbnail || meta.thumbnail || null;
+        const thumbUrl = thumbRel ? `/static/Stories/${encodeURIComponent(id)}/${encodeURIComponent(thumbRel)}` : null;
+        const vmAbs = findVoicemailPath(id);
+        const voicemailUrl = vmAbs ? urlFor(vmAbs) : null;
+        out.push({ id, title: meta.title || id, subtitle: meta.subtitle || "", thumbUrl, voicemailUrl });
+      }
+      return out;
+    })();
 
-    const stories = safeReadJson(path.join(DATA_ROOT, "app/stories.json"), []);
-    const active = Array.isArray(stories) ? stories.find(s => s.active) : null;
-    if (!active) return res.status(400).json({ error: "No active story" });
-
-    await publishStoryToChannel(discordClient, channelId, active);
-    res.json({ ok: true, posted: 1, channelId });
+    if (!stories.length) return res.json({ ok: true, stories: 0, activePosted: 0 });
+    await publishStoryToChannel(channelId, stories[0]);
+    res.json({ ok: true, stories: stories.length, activePosted: 1 });
   } catch (e) {
-    console.error(e);
     res.status(500).json({ error: e.message });
   }
 });
 
-// POST /admin/publish-stories-all — publish ALL stories
-// You can override the channel with JSON body: { "channelId": "1407176815..." }
+// All stories
 app.post("/admin/publish-stories-all", requireAdmin, async (req, res) => {
   try {
-    const overrideId = (req.body && (req.body.channelId || req.body.channel)) ? String(req.body.channelId || req.body.channel) : "";
-    const channelId = overrideId || BREAKING_NEWS_CHANNEL_ID;
-    if (!channelId) return res.status(400).json({ error: "Breaking news channel id not set" });
+    const channelId = (req.body && req.body.channelId) || BREAKING_NEWS_CHANNEL_ID;
+    const root = path.join(DATA_ROOT, "Stories");
+    if (!fs.existsSync(root)) return res.json({ ok: true, stories: 0, posted: 0 });
 
-    const stories = safeReadJson(path.join(DATA_ROOT, "app/stories.json"), []);
-    const list = Array.isArray(stories) ? stories : [];
-    if (!list.length) return res.status(400).json({ error: "No stories to publish" });
-
-    for (const s of list) {
-      await publishStoryToChannel(discordClient, channelId, s);
+    const stories = [];
+    for (const id of fs.readdirSync(root)) {
+      const dir = path.join(root, id);
+      const meta = safeReadJson(path.join(dir, "metadata.json"), { id });
+      const thumbRel = meta.thumbnailYt || meta.youtubeThumbnail || meta.thumbnail || null;
+      const thumbUrl = thumbRel ? `/static/Stories/${encodeURIComponent(id)}/${encodeURIComponent(thumbRel)}` : null;
+      const vmAbs = findVoicemailPath(id);
+      const voicemailUrl = vmAbs ? urlFor(vmAbs) : null;
+      stories.push({ id, title: meta.title || id, subtitle: meta.subtitle || "", thumbUrl, voicemailUrl });
     }
-    res.json({ ok: true, posted: list.length, channelId });
+
+    for (const s of stories) {
+      await publishStoryToChannel(channelId, s);
+    }
+    res.json({ ok: true, stories: stories.length, posted: stories.length });
   } catch (e) {
-    console.error(e);
     res.status(500).json({ error: e.message });
   }
 });
 
-// ---------- 404 ----------
+/* =========================
+   404
+   ========================= */
 app.use((_req, res) => res.status(404).json({ error: "Not found" }));
 
-// ---------- START ----------
+/* =========================
+   START
+   ========================= */
 const PORT = process.env.PORT || 3030;
 app.listen(PORT, () => {
   console.log("[Server] Listening on", PORT);
   console.log("[Server] DATA_ROOT =", DATA_ROOT);
-  // Always maintain a fresh snapshot on boot
-  writeStoriesSnapshot();
+  console.log("[Discord] BreakingNews:", BREAKING_NEWS_CHANNEL_ID,
+              "Confessions:", CONFESSIONS_CHANNEL_ID,
+              "Voicemails:", VOICEMAIL_CHANNEL_ID,
+              "Spotlight:", SPOTLIGHT_CHANNEL_ID);
 });
