@@ -1,4 +1,4 @@
-// SOAPBOX SERVER — stable, forum-safe, legacy voicemail folder, single-attachment posts
+// SOAPBOX SERVER — forum-safe, legacy voicemail folder, single-media + embedded thumbnail
 
 const express = require("express");
 const cors = require("cors");
@@ -28,9 +28,9 @@ const DISCORD_TOKEN            = process.env.DISCORD_TOKEN || "";
 const CONFESSIONS_CHANNEL_ID   = process.env.CONFESSIONS_CHANNEL_ID || "";
 const SPOTLIGHT_CHANNEL_ID     = process.env.SPOTLIGHT_CHANNEL_ID || "";
 const VOICEMAIL_CHANNEL_ID     = process.env.VOICEMAIL_CHANNEL_ID || "";
-const BREAKING_NEWS_CHANNEL_ID = process.env.BREAKING_NEWS_CHANNEL_ID || ""; // forum channel preferred
+const BREAKING_NEWS_CHANNEL_ID = process.env.BREAKING_NEWS_CHANNEL_ID || "";
 
-// Absolute origin for embed images
+// Absolute origin for embed images (must be your public server URL)
 const PUBLIC_BASE = process.env.PUBLIC_BASE || "https://soapbox-server.onrender.com";
 
 // ---------- DISCORD ----------
@@ -72,7 +72,18 @@ function requireAdmin(req, res, next) {
   return res.status(401).json({ error: "Unauthorized" });
 }
 function storyDirOf(id) { return path.join(DATA_ROOT, "Stories", id); }
-function urlFor(absPath) { return "/static" + absPath.replace(DATA_ROOT, "").replace(/\\/g, "/"); }
+
+// Build a /static URL for a file under DATA_ROOT
+function urlFor(absPath) {
+  return "/static" + absPath.replace(DATA_ROOT, "").replace(/\\/g, "/");
+}
+
+// Encode every path segment so spaces etc. work in Discord embeds
+function absUrlEncoded(absPath) {
+  const rel = urlFor(absPath); // like /static/Stories/Story1/My Pic.png
+  const parts = rel.split("/").map((seg, i) => (i === 0 ? seg : encodeURIComponent(seg)));
+  return PUBLIC_BASE + parts.join("/");
+}
 
 function readStoryMeta(id) {
   return safeReadJson(path.join(DATA_ROOT, "Stories", id, "metadata.json"), { id });
@@ -104,7 +115,6 @@ function findVoicemailPath(storyId) {
 }
 
 // ---------- STATIC ALIASES THE APP EXPECTS ----------
-// Avoid Express 5 param wildcards; use regex:
 app.get(/^\/static\/([^/]+)\/(.+)$/, (req, res, next) => {
   const storyId = req.params[0];
   const restRel = req.params[1];
@@ -124,14 +134,12 @@ app.get("/health", (_req, res) => res.json({ ok: true, time: new Date().toISOStr
 
 // ---------- LINKS / SPOTLIGHTS ----------
 app.get("/links", (_req, res) => {
-  // structure: { items: [{title, url, imageKey?, imageUrl?}, ...] }
   res.json(safeReadJson(path.join(DATA_ROOT, "app/links.json"), { items: [] }));
 });
 
 app.get("/spotlights", (_req, res) => res.json(safeReadJson(path.join(DATA_ROOT, "app/spotlights.json"), [])));
 
 app.post("/admin/links", requireAdmin, (req, res) => {
-  // Expect { items: [...] }
   if (!req.body || typeof req.body !== "object" || !Array.isArray(req.body.items)) {
     return res.status(400).json({ error: "Body must be { items: LinkItem[] }" });
   }
@@ -151,7 +159,6 @@ app.post("/admin/spotlights", requireAdmin, async (req, res) => {
   res.json({ ok: true, count: req.body.length });
 });
 
-// App-form spotlights -> Discord (no app posting)
 app.post("/spotlights", async (req, res) => {
   try {
     const { name, link, notes } = req.body || {};
@@ -483,7 +490,6 @@ app.post("/admin/discord/voicemail", requireAdmin, upload.single("audio"), async
     const ch = await discordClient.channels.fetch(VOICEMAIL_CHANNEL_ID);
     if (!ch) return res.status(500).json({ error: "Discord channel not found" });
 
-    // Single attachment only (prefer MP3 here so Discord renders audio inline)
     const files = [new AttachmentBuilder(mp3Path)];
     await ch.send({ content: "📬 New voicemail", files });
 
@@ -563,11 +569,10 @@ async function publishStoryOnce(storyId, channelIdOverride) {
   const files = [];
   if (mediaFile) files.push(new AttachmentBuilder(mediaFile));
 
-  // Thumbnail shown via embed image (not as a second attachment)
+  // Thumbnail shown via embed image (absolute, URL-encoded)
   const embeds = [];
   if (thumbFile) {
-    const thumbUrl = PUBLIC_BASE + urlFor(thumbFile);
-    embeds.push({ image: { url: thumbUrl } });
+    embeds.push({ image: { url: absUrlEncoded(thumbFile) } });
   }
 
   const map = readThreadMap();
@@ -576,11 +581,12 @@ async function publishStoryOnce(storyId, channelIdOverride) {
   const targetChannelId = channelIdOverride || BREAKING_NEWS_CHANNEL_ID || VOICEMAIL_CHANNEL_ID;
   if (!targetChannelId) throw new Error("BREAKING_NEWS_CHANNEL_ID not set and no override provided");
 
-  if (mappedThread) {
-    return await postToExistingThread(mappedThread, content, files, embeds);
-  } else {
-    return await ensureForumThread(targetChannelId, storyId, headline, content, files, embeds);
-  }
+  const result = mappedThread
+    ? await postToExistingThread(mappedThread, content, files, embeds)
+    : await ensureForumThread(targetChannelId, storyId, headline, content, files, embeds);
+
+  console.log("[Publish] story:", storyId, "channel:", targetChannelId, "ok");
+  return result;
 }
 
 async function publishAllActiveStories(channelIdOverride) {
@@ -609,7 +615,6 @@ app.post("/admin/publish-stories-all", requireAdmin, async (req, res) => {
   }
 });
 
-// (kept for compatibility if you were using it previously)
 app.post("/admin/publish-stories", requireAdmin, async (req, res) => {
   try {
     const override = (req.body && req.body.channelId) ? String(req.body.channelId) : "";
@@ -641,7 +646,8 @@ app.get("/admin/debug/story/:id", requireAdmin, (req, res) => {
     voicemailMp3: vmMp3 || null,
     voicemailMp3Bytes: vmMp3Size,
     thumbnail: thumbFile || null,
-    thumbnailBytes: thumbSize
+    thumbnailBytes: thumbSize,
+    embedUrl: thumbFile ? absUrlEncoded(thumbFile) : null
   });
 });
 
@@ -653,4 +659,5 @@ const PORT = process.env.PORT || 3030;
 app.listen(PORT, () => {
   console.log("[Server] Listening on", PORT);
   console.log("[Server] DATA_ROOT =", DATA_ROOT);
+  console.log("[Server] PUBLIC_BASE =", PUBLIC_BASE);
 });
