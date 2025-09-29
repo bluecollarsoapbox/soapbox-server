@@ -616,6 +616,25 @@ app.post("/admin/discord/voicemail", requireAdmin, upload.single("audio"), async
     res.status(500).json({ error: err.message });
   }
 });
+// --- FIX: static aliases (place near your other /static handlers) ---
+
+// Old form I added earlier (keep it):
+app.get(/^\/static\/([^/]+)\/(.+)$/, (req, res, next) => {
+  const storyId = req.params[0];
+  const restRel = req.params[1];
+  const file = path.join(storyDirOf(storyId), restRel);
+  if (!fs.existsSync(file) || fs.statSync(file).isDirectory()) return next();
+  res.sendFile(file);
+});
+
+// NEW: support your real URLs: /static/Stories/:id/:rest
+app.get(/^\/static\/Stories\/([^/]+)\/(.+)$/, (req, res, next) => {
+  const storyId = req.params[0];
+  const restRel = req.params[1];
+  const file = path.join(storyDirOf(storyId), restRel);
+  if (!fs.existsSync(file) || fs.statSync(file).isDirectory()) return next();
+  res.sendFile(file);
+});
 
 // ---------- 404 ----------
 app.use((_req, res) => res.status(404).json({ error: "Not found" }));
