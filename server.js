@@ -118,11 +118,77 @@ app.get("/health", (_req, res) => res.json({ ok: true, time: new Date().toISOStr
 
 // ---------- LINKS / SPOTLIGHTS ----------
 app.get("/links", (_req, res) => {
-  // structure: { items: [{title, url, imageKey?, imageUrl?}, ...] }
   res.json(safeReadJson(path.join(DATA_ROOT, "app/links.json"), { items: [] }));
 });
 
-app.get("/spotlights", (_req, res) => res.json(safeReadJson(path.join(DATA_ROOT, "app/spotlights.json"), [])));
+// Filesystem-driven spotlights:
+// Spotlights/
+//   <Folder A>/title.txt
+//   <Folder A>/link.txt
+//   <Folder A>/<image>.png|jpg|jpeg|webp
+//   <Folder B>/...
+function listSpotlightsFS() {
+  const root = path.join(DATA_ROOT, "Spotlights");
+  if (!fs.existsSync(root)) return [];
+
+  const entries = fs.readdirSync(root, { withFileTypes: true })
+    .filter(d => d.isDirectory());
+
+  const pickImage = (dirAbs) => {
+    const files = fs.readdirSync(dirAbs);
+    const img = files.find(f => /\.(png|jpe?g|webp)$/i.test(f));
+    return img ? img : null;
+  };
+
+  const items = entries.map(ent => {
+    const id = ent.name;                        // folder name
+    const dirAbs = path.join(root, id);
+
+    const titleTxt = path.join(dirAbs, "title.txt");
+    const linkTxt  = path.join(dirAbs, "link.txt");
+
+    const title = fs.existsSync(titleTxt)
+      ? fs.readFileSync(titleTxt, "utf8").toString().trim()
+      : id;
+
+    const url = fs.existsSync(linkTxt)
+      ? fs.readFileSync(linkTxt, "utf8").toString().trim()
+      : "";
+
+    const img = pickImage(dirAbs);
+    const thumb = img
+      ? `/static/Spotlights/${encodeURIComponent(id)}/${encodeURIComponent(img)}`
+      : "";
+
+    // Sort key: newest file/dir mtime so newest appears first
+    const statForSort =
+      img && fs.existsSync(path.join(dirAbs, img))
+        ? fs.statSync(path.join(dirAbs, img)).mtimeMs
+        : fs.statSync(dirAbs).mtimeMs;
+
+    return { id, title, url, thumb, _sort: statForSort };
+  })
+  // only keep items that at least have title + url
+  .filter(x => x.title && x.url)
+  // newest first
+  .sort((a, b) => b._sort - a._sort)
+  // strip helper field
+  .map(({ _sort, ...rest }) => rest);
+
+  return items;
+};
+
+// Returns array: [{ id, title, url, thumb }]
+app.get("/spotlights", (_req, res) => {
+  try {
+    const list = listSpotlightsFS();
+    return res.json(list);
+  } catch (e) {
+    console.error(e);
+    return res.status(500).json({ error: String(e.message || e) });
+  }
+});
+
 
 app.post("/admin/links", requireAdmin, (req, res) => {
   // Expect { items: [...] }
