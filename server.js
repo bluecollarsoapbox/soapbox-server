@@ -168,11 +168,8 @@ function listSpotlightsFS() {
 
     return { id, title, url, thumb, _sort: statForSort };
   })
-  // only keep items that at least have title + url
-  .filter(x => x.title && x.url)
-  // newest first
+  .filter(x => x.title && x.url) // require at least title+url
   .sort((a, b) => b._sort - a._sort)
-  // strip helper field
   .map(({ _sort, ...rest }) => rest);
 
   return items;
@@ -253,15 +250,20 @@ app.get("/stories", (_req, res) => {
   try {
     const root = path.join(DATA_ROOT, "Stories");
     if (!fs.existsSync(root)) return res.json([]);
+
     const out = [];
     for (const id of fs.readdirSync(root)) {
       const dir = path.join(root, id);
       const metaFile = path.join(dir, "metadata.json");
       if (fs.existsSync(dir) && fs.existsSync(metaFile)) {
         const meta = safeReadJson(metaFile, {});
-        const thumbRel = meta.thumbnailYt || meta.youtubeThumbnail || meta.thumbnail || null;
-        // do not encode to keep local filenames intact; the static route handles them
-        const thumbUrl = thumbRel ? `/static/Stories/${id}/${thumbRel}` : null;
+
+        // MAIN LIST SHOULD USE NON-YT THUMB
+        const thumbRelNonYt = meta.thumbnail || null; // preferred for grid/list
+        const thumbRelYt    = meta.thumbnailYt || meta.youtubeThumbnail || null; // for detail
+
+        const thumbUrl   = thumbRelNonYt ? `/static/Stories/${id}/${thumbRelNonYt}` : null;
+        const thumbYtUrl = thumbRelYt    ? `/static/Stories/${id}/${thumbRelYt}`    : null;
 
         const vmAbs = findVoicemailPath(id);
         const voicemailUrl = vmAbs ? urlFor(vmAbs) : null;
@@ -272,7 +274,8 @@ app.get("/stories", (_req, res) => {
           subtitle: meta.subtitle || "",
           active: !!meta.active,
           prompts: Array.isArray(meta.prompts) ? meta.prompts : [],
-          thumbUrl,
+          thumbUrl,        // non-YT (for the headlines page)
+          thumbYtUrl,      // YT version (your detail screen can use this)
           voicemailUrl
         });
       }
