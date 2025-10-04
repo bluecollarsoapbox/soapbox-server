@@ -24,7 +24,7 @@ const DATA_ROOT = process.env.DATA_DIR || process.env.DATA_ROOT || "/opt/render/
 const ADMIN_KEY = process.env.SOAPBOX_API_KEY || "changeme";
 
 // --- VIDEO RULES ---
-const REQUIRE_LANDSCAPE = false; // set true to HARD-REJECT portrait uploads
+const REQUIRE_LANDSCAPE = true; // set true to HARD-REJECT portrait uploads
 const TARGET_W = 1280, TARGET_H = 720; // letterbox target (16:9)
 
 
