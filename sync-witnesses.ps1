@@ -1,66 +1,104 @@
-# ===========================================
-#  Blue Collar Soapbox – Witness Sync Script
-#  Pulls all witness originals from Render to local disk
-# ===========================================
+# ================== CONFIG (edit these 3) ==================
+$BASE = "https://soapbox-server.onrender.com"   # <-- your server base URL
+$ADMIN_KEY = "99dnfneeekdegnrJJSN3JdenrsdnJ"                          # <-- your SOAPBOX_API_KEY
+$DEST = "D:\Soapbox App\soapbox-server\Stories"  # <-- where to save on PC
+$DOWNLOAD_POSTED_TOO = $true                     # set $false to skip watermarked copies
+# ===========================================================
 
-# ---- CONFIG ----
-$BaseUrl = "https://soapbox-server.onrender.com"
-$ApiKey  = "99dnfneeekdegnrJJSN3JdenrsdnJ"          #  <<== REPLACE WITH YOUR SOAPBOX_API_KEY
-$LocalRoot = "D:\Soapbox App\soapbox-server\Stories"
+# Ensure destination exists
+if (!(Test-Path $DEST)) { New-Item -ItemType Directory -Path $DEST | Out-Null }
 
-# ---- HELPERS ----
-function Ensure-Dir($path) {
-    if (-not (Test-Path $path)) {
-        New-Item -ItemType Directory -Path $path | Out-Null
-    }
-}
+# Helper: safe join for Windows paths
+function Join-Path2($a,$b){ return [System.IO.Path]::Combine($a,$b) }
 
-function Download-If-New($url, $dest) {
-    if (Test-Path $dest) {
-        # skip if file already exists and size matches
-        $localSize = (Get-Item $dest).Length
-        try {
-            $req = [System.Net.WebRequest]::Create($url)
-            $req.Method = "HEAD"
-            $res = $req.GetResponse()
-            $remoteSize = [int64]$res.Headers["Content-Length"]
-            $res.Close()
-            if ($remoteSize -eq $localSize) { return }
-        } catch {}
-    }
-
-    Write-Host "Downloading $url -> $dest"
-    Invoke-WebRequest -Uri $url -OutFile $dest -UseBasicParsing
-}
-
-# ---- MAIN ----
-Write-Host "Fetching witness index..." -ForegroundColor Cyan
-$headers = @{ "x-soapbox-key" = $ApiKey }
-
+# 1) Get witness index (admin-protected)
+$indexUrl = "$BASE/admin/witness-index"
 try {
-    $resp = Invoke-RestMethod -Uri "$BaseUrl/admin/witness-index" -Headers $headers -Method GET
+  $resp = Invoke-RestMethod -Method GET -Uri $indexUrl -Headers @{ "x-soapbox-key" = $ADMIN_KEY }
 } catch {
-    Write-Host "❌ Failed to reach server: $($_.Exception.Message)" -ForegroundColor Red
-    exit 1
+  Write-Host "ERROR: Failed to fetch $indexUrl" -ForegroundColor Red
+  Write-Host $_.Exception.Message -ForegroundColor Red
+  exit 1
 }
 
 if (-not $resp.ok) {
-    Write-Host "❌ Server returned error: $($resp.error)" -ForegroundColor Red
-    exit 1
+  Write-Host "Server responded with error: $($resp.error)" -ForegroundColor Red
+  exit 1
 }
 
-foreach ($story in $resp.stories) {
-    $storyId = $story.storyId
-    $files   = $story.files
+# 2) For each story, download originals (and optionally posted)
+#    The index returns only originals by default. We’ll also try posted via predictable paths.
+$stories = $resp.stories
+if (-not $stories -or $stories.Count -eq 0) {
+  Write-Host "No witness originals found on server." -ForegroundColor Yellow
+  exit 0
+}
 
-    $targetDir = Join-Path $LocalRoot "$storyId\witnesses\originals"
-    Ensure-Dir $targetDir
+$downloaded = 0
+$skipped = 0
+$failed = 0
 
-    foreach ($file in $files) {
-        $url  = "$BaseUrl$($file.url)"
-        $dest = Join-Path $targetDir $file.file
-        Download-If-New $url $dest
+foreach ($s in $stories) {
+  $storyId = $s.storyId
+  $storyRoot = Join-Path2 $DEST $storyId
+  $origDir = Join-Path2 $storyRoot "witnesses\originals"
+  $postedDir = Join-Path2 $storyRoot "witnesses\posted"
+  if (!(Test-Path $origDir))   { New-Item -ItemType Directory -Path $origDir -Force | Out-Null }
+  if ($DOWNLOAD_POSTED_TOO -and !(Test-Path $postedDir)) { New-Item -ItemType Directory -Path $postedDir -Force | Out-Null }
+
+  # Originals listed in the index
+  foreach ($f in $s.files) {
+    $name = $f.file
+    $url  = "$BASE$f.url"      # url already starts with /static/...
+    $destFile = Join-Path2 $origDir $name
+
+    if (Test-Path $destFile) {
+      $skipped++
+      continue
     }
+
+    try {
+      Invoke-WebRequest -Uri $url -OutFile $destFile
+      $downloaded++
+      Write-Host "Downloaded: $storyId / originals / $name"
+    } catch {
+      $failed++
+      Write-Host "FAILED: $storyId / originals / $name" -ForegroundColor Red
+    }
+  }
+
+  if ($DOWNLOAD_POSTED_TOO) {
+    # Try to mirror posted files by probing the server filesystem pattern.
+    # We don't have a posted list in /admin/witness-index, so we reconstruct names (same timestamp but .mp4).
+    # Grab timestamps from original filenames (prefix before first dot).
+    foreach ($f in $s.files) {
+      # compute the watermarked filename (server saves posted as {timestamp}.mp4)
+      $timestamp = ($f.file -split '\.')[0]
+      $wmName = "$timestamp.mp4"
+      $wmUrl  = "$BASE/static/Stories/$([uri]::EscapeDataString($storyId))/witnesses/posted/$([uri]::EscapeDataString($wmName))"
+      $wmDest = Join-Path2 $postedDir $wmName
+
+      if (Test-Path $wmDest) { $skipped++; continue }
+
+      try {
+        # We first HEAD to see if it exists; if 404, skip quietly
+        $head = Invoke-WebRequest -Method Head -Uri $wmUrl -ErrorAction Stop
+        Invoke-WebRequest -Uri $wmUrl -OutFile $wmDest
+        $downloaded++
+        Write-Host "Downloaded: $storyId / posted / $wmName"
+      } catch {
+        # ignore if not found; only count as failed for other errors
+        if ($_.Exception.Response.StatusCode.value__ -ne 404) {
+          $failed++
+          Write-Host "FAILED (posted): $storyId / $wmName" -ForegroundColor DarkYellow
+        }
+      }
+    }
+  }
 }
 
-Write-Host "`n✅ Witness sync complete!" -ForegroundColor Green
+Write-Host ""
+Write-Host "=== Sync complete ==="
+Write-Host "Downloaded: $downloaded"
+Write-Host "Skipped (already had): $skipped"
+Write-Host "Failed: $failed"
