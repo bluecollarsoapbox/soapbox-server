@@ -72,6 +72,14 @@ function storyDirOf(id) { return path.join(DATA_ROOT, "Stories", id); }
 function urlFor(absPath) { return "/static" + absPath.replace(DATA_ROOT, "").replace(/\\/g, "/"); }
 function readStoryMeta(id) { return safeReadJson(path.join(DATA_ROOT, "Stories", id, "metadata.json"), { id }); }
 
+// ---- thread map helpers (NEW) ----
+function readThreadMap() {
+  return safeReadJson(path.join(DATA_ROOT, "app", "threads.json"), {}); // { StoryId: "discordThreadId" }
+}
+function writeThreadMap(map) {
+  writeJson(path.join(DATA_ROOT, "app", "threads.json"), map || {});
+}
+
 // ---- LEGACY: find voicemail MP3 like it used to ----
 function findVoicemailPath(storyId) {
   const dir = storyDirOf(storyId);
@@ -122,11 +130,6 @@ app.get("/links", (_req, res) => {
 });
 
 // Filesystem-driven spotlights:
-// Spotlights/
-//   <Folder A>/title.txt
-//   <Folder A>/link.txt
-//   <Folder A>/<image>.png|jpg|jpeg|webp
-//   <Folder B>/...
 function listSpotlightsFS() {
   const root = path.join(DATA_ROOT, "Spotlights");
   if (!fs.existsSync(root)) return [];
@@ -168,7 +171,7 @@ function listSpotlightsFS() {
 
     return { id, title, url, thumb, _sort: statForSort };
   })
-  .filter(x => x.title && x.url) // require at least title+url
+  .filter(x => x.title && x.url)
   .sort((a, b) => b._sort - a._sort)
   .map(({ _sort, ...rest }) => rest);
 
@@ -405,243 +408,72 @@ app.post("/admin/story/:id/voicemail", requireAdmin, upload.single("audio"), asy
   }
 });
 
-// ---------- THREAD MAP (optional) ----------
-function readThreadMap() {
-  return safeReadJson(path.join(DATA_ROOT, "app", "threads.json"), {}); // { StoryId: "discordThreadId" }
-}
-
-// ---------- DISCORD PUBLISH HELPERS ----------
-function resolveStoryAssets(storyId) {
-  const dir = storyDirOf(storyId);
-  const meta = readStoryMeta(storyId);
-  const title = (meta.title || storyId).toString();
-  const sub = (meta.subtitle || "").toString();
-
-  const thumbRel = meta.thumbnailYt || meta.youtubeThumbnail || meta.thumbnail || null;
-  const thumbFile = thumbRel ? path.join(dir, thumbRel) : null;
-
-  // Prefer MP3 (reliable inline audio player) for the post
-  const vmMp3 = findVoicemailPath(storyId);
-  const mediaFile = (vmMp3 && fs.existsSync(vmMp3)) ? vmMp3 : null;
-
-  return {
-    title,
-    sub,
-    thumbFile: (thumbFile && fs.existsSync(thumbFile)) ? thumbFile : null,
-    mediaFile
-  };
-}
-
-async function ensureForumThread(channelId, storyId, titleText, embeds, files) {
-  const ch = await discordClient.channels.fetch(channelId);
-  if (!ch) throw new Error("Breaking News channel not found");
-
-  if (ch.type === ChannelType.GuildForum) {
-    // Create a forum post (initial message only — no extra send)
-    const created = await ch.threads.create({
-      name: titleText,
-      message: { embeds, files }
-    });
-    return created;
-  } else {
-    // Non-forum fallback: just a channel message
-    const msg = await ch.send({ embeds, files });
-    return msg;
-  }
-}
-
-async function postToExistingThread(threadId, contentOrEmbeds, files) {
-  const thread = await discordClient.channels.fetch(threadId);
-  if (!thread) throw new Error("Thread not found");
-  // contentOrEmbeds can be string content or embeds array
-  if (Array.isArray(contentOrEmbeds)) {
-    return thread.send({ embeds: contentOrEmbeds, files });
-  }
-  return thread.send({ content: contentOrEmbeds, files });
-}
-
-async function publishStoryOnce(storyId, channelIdOverride) {
-  // If you have a custom poster, you can keep using it
-  if (externalPoster && typeof externalPoster === "function") {
-    try { return await externalPoster(discordClient, storyId); }
-    catch (e) { console.warn("[DiscordPoster] external poster failed:", e.message || e); }
-  }
-
-  const { title, sub, thumbFile, mediaFile } = resolveStoryAssets(storyId);
-
-  const headline = title?.trim() || storyId;
-  const subline = sub?.trim() || "";
-
-  // Build a single embed with big image + title/description
-  const embeds = [{
-    title: headline,
-    description: subline || undefined,
-    image: thumbFile ? { url: "attachment://thumb" + path.extname(thumbFile).toLowerCase() } : undefined,
-  }];
-
-  // Attachments: always include thumbnail if present, and also include MP3 if present
-  const files = [];
-  if (thumbFile) files.push(new AttachmentBuilder(thumbFile, { name: "thumb" + path.extname(thumbFile).toLowerCase() }));
-  if (mediaFile) files.push(new AttachmentBuilder(mediaFile, { name: "voicemail.mp3" }));
-
-  const map = readThreadMap();
-  const mappedThread = map[storyId];
-
-  const targetChannelId = channelIdOverride || BREAKING_NEWS_CHANNEL_ID || VOICEMAIL_CHANNEL_ID;
-  if (!targetChannelId) throw new Error("BREAKING_NEWS_CHANNEL_ID not set and no override provided");
-
-  if (mappedThread) {
-    return await postToExistingThread(mappedThread, embeds, files);
-  } else {
-    return await ensureForumThread(targetChannelId, storyId, headline, embeds, files);
-  }
-}
-
-async function publishActiveStories(channelIdOverride) {
-  const ids = allStoryIds().filter(id => readMeta(id).active);
-  const results = [];
-  for (const id of ids) {
-    try {
-      const r = await publishStoryOnce(id, channelIdOverride);
-      results.push({ id, ok: true, ref: r.id || null });
-    } catch (e) {
-      results.push({ id, ok: false, error: e.message || String(e) });
-    }
-  }
-  return results;
-}
-
-async function publishAllStories(channelIdOverride) {
-  const ids = allStoryIds();
-  const results = [];
-  for (const id of ids) {
-    try {
-      const r = await publishStoryOnce(id, channelIdOverride);
-      results.push({ id, ok: true, ref: r.id || null });
-    } catch (e) {
-      results.push({ id, ok: false, error: e.message || String(e) });
-    }
-  }
-  return results;
-}
-
-// ---------- ADMIN: PUBLISH ----------
-app.post("/admin/publish-stories-all", requireAdmin, async (req, res) => {
-  try {
-    const override = (req.body && req.body.channelId) ? String(req.body.channelId) : "";
-    const results = await publishAllStories(override);
-    res.json({ ok: true, results });
-  } catch (e) {
-    console.error(e);
-    res.status(500).json({ error: e.message || String(e) });
-  }
-});
-
-app.post("/admin/publish-stories", requireAdmin, async (req, res) => {
-  try {
-    const override = (req.body && req.body.channelId) ? String(req.body.channelId) : "";
-    const results = await publishActiveStories(override);
-    res.json({ ok: true, results });
-  } catch (e) {
-    console.error(e);
-    res.status(500).json({ error: e.message || String(e) });
-  }
-});
-
-// ---------- WITNESS UPLOADS ----------
-// Try to watermark using ffmpeg if present (non-fatal if not)
-async function maybeWatermark(inputPath, outputPath) {
-  let ffmpeg, ffmpegPath;
-  try {
-    ffmpeg = require("fluent-ffmpeg");
-  } catch (_) {
-    return null; // no watermarking
-  }
-
-  // Resolve ffmpeg binary safely
-  try {
-    const staticPath = require("ffmpeg-static");
-    if (staticPath && fs.existsSync(staticPath)) ffmpegPath = staticPath;
-  } catch(_) {}
-  if (!ffmpegPath) {
-    try {
-      const inst = require("@ffmpeg-installer/ffmpeg");
-      if (inst && inst.path && fs.existsSync(inst.path)) ffmpegPath = inst.path;
-    } catch(_) {}
-  }
-  if (!ffmpegPath) return null;
-
-  ffmpeg.setFfmpegPath(ffmpegPath);
-
-  const wm1 = path.join(DATA_ROOT, "app", "watermark.png");
-  const wm2 = path.join(DATA_ROOT, "app", "wm.png");
-  const wm = fs.existsSync(wm1) ? wm1 : (fs.existsSync(wm2) ? wm2 : null);
-  if (!wm) return null;
-
-  ensureDir(path.dirname(outputPath));
-
-  return new Promise((resolve, reject) => {
-    ffmpeg(inputPath)
-      .outputOptions([
-        "-movflags +faststart",
-        "-c:v libx264",
-        "-c:a copy"
-      ])
-      .videoFilters(`overlay=10:10`)
-      .input(wm)
-      .complexFilter("[0:v][1:v]overlay=10:10")
-      .on("error", (e) => { try { fs.unlinkSync(outputPath); } catch(_) {} reject(e); })
-      .on("end", () => resolve(outputPath))
-      .save(outputPath);
-  }).catch(() => null);
-}
-
-// Post file to the story's mapped thread if available, else fall back to VOICEMAILS channel
-async function postWitnessToThreadOrFallback(storyId, absFilePath) {
-  const map = readThreadMap();
-  const mappedThread = map[storyId];
-
-  if (mappedThread) {
-    const thread = await discordClient.channels.fetch(mappedThread);
-    if (thread) {
-      return thread.send({ content: `🎥 Witness submission — **${storyId}**`, files: [new AttachmentBuilder(absFilePath)] });
-    }
-  }
-
-  if (!VOICEMAIL_CHANNEL_ID) throw new Error("VOICEMAIL_CHANNEL_ID not set");
-  const ch = await discordClient.channels.fetch(VOICEMAIL_CHANNEL_ID);
-  if (!ch) throw new Error("Discord channel not found");
-  return ch.send({ content: `🎥 Witness submission — **${storyId}**`, files: [new AttachmentBuilder(absFilePath)] });
-}
-
+// ---------- WITNESS UPLOADS (NEW) ----------
+// Posts the uploaded video into the story's Breaking News forum thread.
+// Creates the thread if it doesn't exist yet, and remembers it in app/threads.json.
 app.post("/admin/story/:id/witness", requireAdmin, upload.single("video"), async (req, res) => {
   try {
     const storyId = req.params.id;
     if (!req.file) return res.status(400).json({ error: "Missing video" });
 
-    const wtRoot = path.join(storyDirOf(storyId), "witnesses");
-    const originalsDir = path.join(wtRoot, "originals");
-    const postedDir = path.join(wtRoot, "posted");
-    ensureDir(originalsDir);
-    ensureDir(postedDir);
-
+    // save original
+    const wtDir = path.join(storyDirOf(storyId), "witnesses");
+    ensureDir(wtDir);
     const ts = Date.now();
     const ext = path.extname(req.file.originalname || "").toLowerCase() || ".mp4";
-    const originalPath = path.join(originalsDir, `${ts}${ext}`);
-    fs.renameSync(req.file.path, originalPath);
+    const outPath = path.join(wtDir, `${ts}${ext}`);
+    fs.renameSync(req.file.path, outPath);
 
-    // Try watermarking; if it fails or not available, use original
-    const watermarkedPath = path.join(postedDir, `${ts}.mp4`);
-    let toSend = await maybeWatermark(originalPath, watermarkedPath);
-    if (!toSend) toSend = originalPath;
+    if (!BREAKING_NEWS_CHANNEL_ID) return res.status(500).json({ error: "BREAKING_NEWS_CHANNEL_ID not set" });
 
-    await postWitnessToThreadOrFallback(storyId, toSend);
+    // get headline/sub for thread creation (if needed)
+    const meta = readStoryMeta(storyId);
+    const headline = (meta.title || storyId).toString();
+    const subline = (meta.subtitle || "").toString();
+    const content = subline ? `**${headline}**\n${subline}` : `**${headline}**`;
 
-    res.json({
-      ok: true,
-      original: urlFor(originalPath),
-      posted: toSend === originalPath ? null : urlFor(watermarkedPath)
+    // read map and resolve thread
+    const map = readThreadMap();
+    let threadId = map[storyId];
+
+    // fetch channel
+    const ch = await discordClient.channels.fetch(BREAKING_NEWS_CHANNEL_ID);
+    if (!ch) return res.status(500).json({ error: "Breaking News channel not found" });
+
+    let threadChannel = null;
+
+    // try existing thread
+    if (threadId) {
+      try { threadChannel = await discordClient.channels.fetch(threadId); }
+      catch (_) { threadChannel = null; }
+    }
+
+    // create forum thread if needed
+    if (!threadChannel) {
+      if (ch.type === ChannelType.GuildForum) {
+        const created = await ch.threads.create({
+          name: headline,
+          message: { content }
+        });
+        threadChannel = created;
+        threadId = created.id;
+        map[storyId] = threadId;
+        writeThreadMap(map);
+      } else {
+        // non-forum fallback: just post into the channel
+        const msg = await ch.send({ content });
+        threadChannel = msg.channel;
+        threadId = msg.channelId;
+      }
+    }
+
+    // post the video into the thread
+    await threadChannel.send({
+      content: `🎥 Witness submission — **${storyId}**`,
+      files: [new AttachmentBuilder(outPath)]
     });
+
+    res.json({ ok: true, url: urlFor(outPath), threadId });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: err.message });
