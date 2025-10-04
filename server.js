@@ -32,7 +32,7 @@ const TARGET_W = 1280, TARGET_H = 720; // letterbox target (16:9)
 const DISCORD_TOKEN            = process.env.DISCORD_TOKEN || "";
 const CONFESSIONS_CHANNEL_ID   = process.env.CONFESSIONS_CHANNEL_ID || "";
 const SPOTLIGHT_CHANNEL_ID     = process.env.SPOTLIGHT_CHANNEL_ID || "";
-const VOICEMAIL_CHANNEL_ID     = process.env.VOICEMAIL_CHANNEL_ID || "";
+const VOICEMAIL_CHANNEL_ID     = process.envVOICEMAIL_CHANNEL_ID || process.env.VOICEMAIL_CHANNEL_ID || "";
 const BREAKING_NEWS_CHANNEL_ID = process.env.BREAKING_NEWS_CHANNEL_ID || "1407176815285637313"; // forum channel
 
 // ---------- DISCORD ----------
@@ -130,7 +130,7 @@ app.get("/health", (_req, res) => res.json({ ok: true, time: new Date().toISOStr
 
 // ---------- LINKS / SPOTLIGHTS ----------
 app.get("/links", (_req, res) => {
-  res.json(safeReadJson(path.join(DATA_ROOT, "app/links.json"), { items: [] }));
+  res.json(safeReadJson(path.join(DATA_ROOT, "app", "links.json"), { items: [] }));
 });
 
 // Filesystem-driven spotlights:
@@ -179,7 +179,7 @@ function listSpotlightsFS() {
   .map(({ _sort, ...rest }) => rest);
 
   return items;
-};
+}
 
 app.get("/spotlights", (_req, res) => {
   try {
@@ -365,6 +365,84 @@ app.post("/admin/story/:id/thumbnail-yt", requireAdmin, upload.single("file"), (
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// ---------- ffprobe (dims) ----------
+async function getVideoDims(filePath) {
+  try {
+    const ffmpeg = require("fluent-ffmpeg");
+    return new Promise((resolve) => {
+      ffmpeg.ffprobe(filePath, (err, data) => {
+        if (err) return resolve(null);
+        const vs = (data.streams || []).find(s => s.codec_type === "video");
+        if (!vs) return resolve(null);
+        const w = Number(vs.width || 0), h = Number(vs.height || 0);
+        resolve({ width: w, height: h });
+      });
+    });
+  } catch (_) {
+    return null;
+  }
+}
+
+// ---------- GLOBAL maybeWatermark (letterbox 16:9 + optional watermark) ----------
+async function maybeWatermark(inputPath, outputPath) {
+  let ffmpeg, ffmpegPath;
+  try { ffmpeg = require("fluent-ffmpeg"); } catch (_) { return null; }
+
+  // Resolve ffmpeg binary
+  try {
+    const staticPath = require("ffmpeg-static");
+    if (staticPath && fs.existsSync(staticPath)) ffmpegPath = staticPath;
+  } catch(_) {}
+  if (!ffmpegPath) {
+    try {
+      const inst = require("@ffmpeg-installer/ffmpeg");
+      if (inst && inst.path && fs.existsSync(inst.path)) ffmpegPath = inst.path;
+    } catch(_) {}
+  }
+  if (!ffmpegPath) return null;
+
+  ffmpeg.setFfmpegPath(ffmpegPath);
+
+  // Optional watermark image
+  const wm1 = path.join(DATA_ROOT, "app", "watermark.png");
+  const wm2 = path.join(DATA_ROOT, "app", "wm.png");
+  const wm = fs.existsSync(wm1) ? wm1 : (fs.existsSync(wm2) ? wm2 : null);
+
+  ensureDir(path.dirname(outputPath));
+
+  // scale to fit, pad to 1280x720, keep SAR=1, then overlay watermark if present
+  const baseScalePad =
+    `scale=${TARGET_W}:${TARGET_H}:force_original_aspect_ratio=decrease,` +
+    `pad=${TARGET_W}:${TARGET_H}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1`;
+
+  return new Promise((resolve, reject) => {
+    const cmd = ffmpeg(inputPath)
+      .outputOptions([
+        "-movflags +faststart",
+        "-c:v libx264",
+        "-preset veryfast",
+        "-crf 23",
+        "-c:a aac",
+        "-b:a 160k"
+      ]);
+
+    if (wm) {
+      cmd.input(wm)
+         .complexFilter([
+           `[0:v]${baseScalePad}[v0]`,
+           `[v0][1:v]overlay=10:10[vout]`
+         ])
+         .outputOptions(["-map", "[vout]", "-map", "0:a?"]);
+    } else {
+      cmd.videoFilters(baseScalePad);
+    }
+
+    cmd.on("error", (e) => { try { fs.unlinkSync(outputPath); } catch(_) {} reject(e); })
+       .on("end", () => resolve(outputPath))
+       .save(outputPath);
+  }).catch(() => null);
+}
+
 // ---------- ADMIN: VOICEMAIL UPLOAD (per story) ----------
 app.post("/admin/story/:id/voicemail", requireAdmin, upload.single("audio"), async (req, res) => {
   try {
@@ -397,67 +475,6 @@ app.post("/admin/story/:id/voicemail", requireAdmin, upload.single("audio"), asy
     } else {
       mp4Path = null;
     }
-
-    // Try to watermark AND normalize aspect to 16:9. Returns outputPath or null on failure.
-async function maybeWatermark(inputPath, outputPath) {
-  let ffmpeg, ffmpegPath;
-  try { ffmpeg = require("fluent-ffmpeg"); } catch (_) { return null; }
-
-  // Resolve ffmpeg binary
-  try {
-    const staticPath = require("ffmpeg-static");
-    if (staticPath && fs.existsSync(staticPath)) ffmpegPath = staticPath;
-  } catch(_) {}
-  if (!ffmpegPath) {
-    try {
-      const inst = require("@ffmpeg-installer/ffmpeg");
-      if (inst && inst.path && fs.existsSync(inst.path)) ffmpegPath = inst.path;
-    } catch(_) {}
-  }
-  if (!ffmpegPath) return null;
-
-  ffmpeg.setFfmpegPath(ffmpegPath);
-
-  // Optional watermark image
-  const wm1 = path.join(DATA_ROOT, "app", "watermark.png");
-  const wm2 = path.join(DATA_ROOT, "app", "wm.png");
-  const wm = fs.existsSync(wm1) ? wm1 : (fs.existsSync(wm2) ? wm2 : null);
-
-  fs.mkdirSync(path.dirname(outputPath), { recursive: true });
-
-  // Build filter graph: scale to fit, pad to 1280x720, keep SAR=1, then overlay watermark if present
-  const baseScalePad = `scale=${TARGET_W}:${TARGET_H}:force_original_aspect_ratio=decrease,` +
-                       `pad=${TARGET_W}:${TARGET_H}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1`;
-
-  return new Promise((resolve, reject) => {
-    const cmd = ffmpeg(inputPath)
-      .outputOptions([
-        "-movflags +faststart",
-        "-c:v libx264",
-        "-preset veryfast",
-        "-crf 23",
-        "-c:a aac",
-        "-b:a 160k"
-      ]);
-
-    if (wm) {
-      cmd.input(wm)
-         .complexFilter([
-           `[0:v]${baseScalePad}[v0]`,
-           `[v0][1:v]overlay=10:10[vout]`
-         ])
-         .outputOptions(["-map", "[vout]", "-map", "0:a?"]);
-    } else {
-      cmd.videoFilters(baseScalePad);
-    }
-
-    cmd
-      .on("error", (e) => { try { fs.unlinkSync(outputPath); } catch(_) {} reject(e); })
-      .on("end", () => resolve(outputPath))
-      .save(outputPath);
-  }).catch(() => null);
-}
-
 
     res.json({ ok: true, mp3: urlFor(mp3Path), mp4: mp4Path ? urlFor(mp4Path) : null });
   } catch (err) {
@@ -567,9 +584,7 @@ async function publishStoryOnce(storyId, channelIdOverride) {
   const targetChannelId = channelIdOverride || BREAKING_NEWS_CHANNEL_ID || VOICEMAIL_CHANNEL_ID;
   if (!targetChannelId) throw new Error("BREAKING_NEWS_CHANNEL_ID not set and no override provided");
 
-  // ✅ Reuse or create thread, and SAVE the mapping
   const thread = await getOrCreateThread(targetChannelId, storyId, headline, subline ? `**${headline}**\n${subline}` : `**${headline}**`);
-
   if (thread.type === ChannelType.GuildForum || thread.isThread?.()) {
     return await thread.send({ embeds, files });
   }
@@ -635,31 +650,13 @@ app.post("/admin/publish-stories", requireAdmin, async (req, res) => {
   }
 });
 
-async function getVideoDims(filePath) {
-  try {
-    const ffmpeg = require("fluent-ffmpeg");
-    return new Promise((resolve, reject) => {
-      ffmpeg.ffprobe(filePath, (err, data) => {
-        if (err) return resolve(null);
-        const vs = (data.streams || []).find(s => s.codec_type === "video");
-        if (!vs) return resolve(null);
-        const w = Number(vs.width || 0), h = Number(vs.height || 0);
-        resolve({ width: w, height: h });
-      });
-    });
-  } catch (_) {
-    return null;
-  }
-}
-
-
 // ---------- ADMIN: WITNESS (posts into story's thread) ----------
 app.post("/admin/story/:id/witness", requireAdmin, upload.single("video"), async (req, res) => {
   try {
     const storyId = req.params.id;
     if (!req.file) return res.status(400).json({ error: "Missing video" });
 
-    // Save originals and posted copies in predictable places
+    // Save originals and posted copies
     const wtRoot       = path.join(storyDirOf(storyId), "witnesses");
     const originalsDir = path.join(wtRoot, "originals");
     const postedDir    = path.join(wtRoot, "posted");
@@ -671,7 +668,16 @@ app.post("/admin/story/:id/witness", requireAdmin, upload.single("video"), async
     const originalPath = path.join(originalsDir, `${ts}${ext}`);
     fs.renameSync(req.file.path, originalPath);
 
-    // Try watermark/normalize if ffmpeg is available; otherwise use the original
+    // HARD reject portrait if configured
+    if (REQUIRE_LANDSCAPE) {
+      const dims = await getVideoDims(originalPath);
+      if (dims && dims.width && dims.height && dims.height > dims.width) {
+        try { fs.unlinkSync(originalPath); } catch(_) {}
+        return res.status(400).json({ error: "Please upload landscape (wide) video. Portrait is not accepted." });
+      }
+    }
+
+    // Try watermark/normalize; else send original
     const watermarkedPath = path.join(postedDir, `${ts}.mp4`);
     let toSend = await maybeWatermark(originalPath, watermarkedPath);
     if (!toSend) toSend = originalPath;
@@ -688,14 +694,12 @@ app.post("/admin/story/:id/witness", requireAdmin, upload.single("video"), async
           files: [new AttachmentBuilder(toSend)]
         });
       } else {
-        // fallback if mapping is stale
         if (!VOICEMAIL_CHANNEL_ID) return res.status(500).json({ error: "VOICEMAIL_CHANNEL_ID not set" });
         const ch = await discordClient.channels.fetch(VOICEMAIL_CHANNEL_ID);
         if (!ch) return res.status(500).json({ error: "Discord channel not found" });
         await ch.send({ content: `🎥 Witness submission — **${storyId}**`, files: [new AttachmentBuilder(toSend)] });
       }
     } else {
-      // no mapping -> fallback
       if (!VOICEMAIL_CHANNEL_ID) return res.status(500).json({ error: "VOICEMAIL_CHANNEL_ID not set" });
       const ch = await discordClient.channels.fetch(VOICEMAIL_CHANNEL_ID);
       if (!ch) return res.status(500).json({ error: "Discord channel not found" });
@@ -845,45 +849,6 @@ app.post("/admin/discord/voicemail", requireAdmin, upload.single("audio"), async
 // ---- WITNESS INDEX (for local sync; admin-protected)
 app.get("/admin/witness-index", requireAdmin, (_req, res) => {
   try {
-    const root = path.join(DATA_ROOT, "Stories");
-    const out = {};
-    if (fs.existsSync(root)) {
-      for (const id of fs.readdirSync(root)) {
-        const dir = path.join(root, id);
-        const meta = path.join(dir, "metadata.json");
-        if (!fs.existsSync(meta)) continue;
-
-        const witRoot = path.join(dir, "witnesses");
-        const originalsDir = path.join(witRoot, "originals");
-        const postedDir    = path.join(witRoot, "posted");
-
-        const listDir = (abs) => {
-          if (!fs.existsSync(abs)) return [];
-          return fs.readdirSync(abs)
-            .filter(f => !fs.statSync(path.join(abs, f)).isDirectory())
-            .map(f => ({
-              name: f,
-              bytes: fs.statSync(path.join(abs, f)).size,
-              mtime: fs.statSync(path.join(abs, f)).mtimeMs,
-              url: urlFor(path.join(abs, f)),
-            }));
-        };
-
-        out[id] = {
-          originals: listDir(originalsDir),
-          posted:    listDir(postedDir),
-        };
-      }
-    }
-    res.json({ ok: true, stories: out });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: e.message || String(e) });
-  }
-});
-
-// ---------- WITNESS INDEX (for local sync; admin-protected) ----------
-app.get("/admin/witness-index", requireAdmin, (_req, res) => {
-  try {
     const storiesRoot = path.join(DATA_ROOT, "Stories");
     if (!fs.existsSync(storiesRoot)) {
       return res.json({ ok: true, stories: [] });
@@ -913,7 +878,6 @@ app.get("/admin/witness-index", requireAdmin, (_req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
-
 
 // ---------- 404 ----------
 app.use((_req, res) => res.status(404).json({ error: "Not found" }));
