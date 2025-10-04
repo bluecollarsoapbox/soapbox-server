@@ -737,6 +737,46 @@ app.post("/admin/discord/voicemail", requireAdmin, upload.single("audio"), async
   }
 });
 
+// ---- WITNESS INDEX (for local sync; admin-protected)
+app.get("/admin/witness-index", requireAdmin, (_req, res) => {
+  try {
+    const root = path.join(DATA_ROOT, "Stories");
+    const out = {};
+    if (fs.existsSync(root)) {
+      for (const id of fs.readdirSync(root)) {
+        const dir = path.join(root, id);
+        const meta = path.join(dir, "metadata.json");
+        if (!fs.existsSync(meta)) continue;
+
+        const witRoot = path.join(dir, "witnesses");
+        const originalsDir = path.join(witRoot, "originals");
+        const postedDir    = path.join(witRoot, "posted");
+
+        const listDir = (abs) => {
+          if (!fs.existsSync(abs)) return [];
+          return fs.readdirSync(abs)
+            .filter(f => !fs.statSync(path.join(abs, f)).isDirectory())
+            .map(f => ({
+              name: f,
+              bytes: fs.statSync(path.join(abs, f)).size,
+              mtime: fs.statSync(path.join(abs, f)).mtimeMs,
+              url: urlFor(path.join(abs, f)),
+            }));
+        };
+
+        out[id] = {
+          originals: listDir(originalsDir),
+          posted:    listDir(postedDir),
+        };
+      }
+    }
+    res.json({ ok: true, stories: out });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message || String(e) });
+  }
+});
+
+
 // ---------- 404 ----------
 app.use((_req, res) => res.status(404).json({ error: "Not found" }));
 
