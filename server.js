@@ -776,6 +776,39 @@ app.get("/admin/witness-index", requireAdmin, (_req, res) => {
   }
 });
 
+// ---------- WITNESS INDEX (for local sync; admin-protected) ----------
+app.get("/admin/witness-index", requireAdmin, (_req, res) => {
+  try {
+    const storiesRoot = path.join(DATA_ROOT, "Stories");
+    if (!fs.existsSync(storiesRoot)) {
+      return res.json({ ok: true, stories: [] });
+    }
+
+    const result = [];
+
+    for (const storyId of fs.readdirSync(storiesRoot)) {
+      const witDir = path.join(storiesRoot, storyId, "witnesses", "originals");
+      if (!fs.existsSync(witDir)) continue;
+
+      const files = fs.readdirSync(witDir)
+        .filter(f => /\.(mp4|mov|mkv|avi)$/i.test(f))
+        .map(f => ({
+          file: f,
+          url: `/static/Stories/${encodeURIComponent(storyId)}/witnesses/originals/${encodeURIComponent(f)}`
+        }));
+
+      if (files.length) {
+        result.push({ storyId, files });
+      }
+    }
+
+    res.json({ ok: true, stories: result });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 
 // ---------- 404 ----------
 app.use((_req, res) => res.status(404).json({ error: "Not found" }));
