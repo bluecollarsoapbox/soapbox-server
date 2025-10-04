@@ -659,49 +659,54 @@ app.post("/admin/story/:id/witness", requireAdmin, upload.single("video"), async
     const storyId = req.params.id;
     if (!req.file) return res.status(400).json({ error: "Missing video" });
 
-    const wtDir = path.join(storyDirOf(storyId), "witnesses");
-    ensureDir(wtDir);
-    const ts = Date.now();
-    const ext = path.extname(req.file.originalname || "").toLowerCase() || ".mp4";
-    const outPath = path.join(wtDir, `${ts}${ext}`);
-    fs.renameSync(req.file.path, outPath);
+    // Save originals and posted copies in predictable places
+    const wtRoot       = path.join(storyDirOf(storyId), "witnesses");
+    const originalsDir = path.join(wtRoot, "originals");
+    const postedDir    = path.join(wtRoot, "posted");
+    ensureDir(originalsDir);
+    ensureDir(postedDir);
 
-    if (!BREAKING_NEWS_CHANNEL_ID) return res.status(500).json({ error: "BREAKING_NEWS_CHANNEL_ID not set" });
+    const ts           = Date.now();
+    const ext          = path.extname(req.file.originalname || "").toLowerCase() || ".mp4";
+    const originalPath = path.join(originalsDir, `${ts}${ext}`);
+    fs.renameSync(req.file.path, originalPath);
 
-    const meta = readStoryMeta(storyId);
-    const headline = (meta.title || storyId).toString();
-    const subline = (meta.subtitle || "").toString();
+    // Try watermark/normalize if ffmpeg is available; otherwise use the original
+    const watermarkedPath = path.join(postedDir, `${ts}.mp4`);
+    let toSend = await maybeWatermark(originalPath, watermarkedPath);
+    if (!toSend) toSend = originalPath;
 
-    // After: fs.renameSync(req.file.path, originalPath);
+    // Post into the mapped thread if present, else Voicemails channel
+    const map = readThreadMap();
+    const mappedThread = map[storyId];
 
-// Optional: enforce landscape uploads
-const dims = await getVideoDims(originalPath);
-if (REQUIRE_LANDSCAPE && dims && dims.width && dims.height && dims.height > dims.width) {
-  // cleanup and reject
-  try { fs.unlinkSync(originalPath); } catch(_) {}
-  return res.status(400).json({ error: "Please upload landscape (wide) video. Portrait is not accepted." });
-}
+    if (mappedThread) {
+      const thread = await discordClient.channels.fetch(mappedThread);
+      if (thread) {
+        await thread.send({
+          content: `🎥 Witness submission — **${storyId}**`,
+          files: [new AttachmentBuilder(toSend)]
+        });
+      } else {
+        // fallback if mapping is stale
+        if (!VOICEMAIL_CHANNEL_ID) return res.status(500).json({ error: "VOICEMAIL_CHANNEL_ID not set" });
+        const ch = await discordClient.channels.fetch(VOICEMAIL_CHANNEL_ID);
+        if (!ch) return res.status(500).json({ error: "Discord channel not found" });
+        await ch.send({ content: `🎥 Witness submission — **${storyId}**`, files: [new AttachmentBuilder(toSend)] });
+      }
+    } else {
+      // no mapping -> fallback
+      if (!VOICEMAIL_CHANNEL_ID) return res.status(500).json({ error: "VOICEMAIL_CHANNEL_ID not set" });
+      const ch = await discordClient.channels.fetch(VOICEMAIL_CHANNEL_ID);
+      if (!ch) return res.status(500).json({ error: "Discord channel not found" });
+      await ch.send({ content: `🎥 Witness submission — **${storyId}**`, files: [new AttachmentBuilder(toSend)] });
+    }
 
-// Always normalize to 16:9 with letterbox (and watermark if present)
-const watermarkedPath = path.join(postedDir, `${ts}.mp4`);
-let toSend = await maybeWatermark(originalPath, watermarkedPath);
-if (!toSend) toSend = originalPath; // fallback if ffmpeg missing
-
-
-    // ✅ Reuse existing thread or find by name before creating
-    const thread = await getOrCreateThread(
-      BREAKING_NEWS_CHANNEL_ID,
-      storyId,
-      headline,
-      subline ? `**${headline}**\n${subline}` : `**${headline}**`
-    );
-
-    await thread.send({
-      content: `🎥 Witness submission — **${storyId}**`,
-      files: [new AttachmentBuilder(outPath)]
+    res.json({
+      ok: true,
+      original: urlFor(originalPath),
+      posted: toSend === originalPath ? null : urlFor(watermarkedPath)
     });
-
-    res.json({ ok: true, url: urlFor(outPath), threadId: thread.id || null });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: err.message });
