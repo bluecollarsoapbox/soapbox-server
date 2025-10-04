@@ -4,9 +4,7 @@
   "private": true,
   "description": "Blue Collar Soapbox API + Discord bot",
   "main": "server.js",
-  "engines": {
-    "node": "20.x"
-  },
+  "engines": { "node": "20.x" },
   "type": "commonjs",
   "scripts": {
     "start": "node server.js",
@@ -19,6 +17,7 @@
   "license": "ISC",
   "dependencies": {
     "@ffmpeg-installer/ffmpeg": "^1.1.0",
+    "@ffprobe-installer/ffprobe": "^1.4.1",
     "archiver": "^7.0.1",
     "chokidar": "^4.0.3",
     "cors": "^2.8.5",

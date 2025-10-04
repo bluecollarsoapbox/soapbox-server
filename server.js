@@ -32,7 +32,7 @@ const TARGET_W = 1280, TARGET_H = 720; // letterbox target (16:9)
 const DISCORD_TOKEN            = process.env.DISCORD_TOKEN || "";
 const CONFESSIONS_CHANNEL_ID   = process.env.CONFESSIONS_CHANNEL_ID || "";
 const SPOTLIGHT_CHANNEL_ID     = process.env.SPOTLIGHT_CHANNEL_ID || "";
-const VOICEMAIL_CHANNEL_ID     = process.envVOICEMAIL_CHANNEL_ID || process.env.VOICEMAIL_CHANNEL_ID || "";
+const VOICEMAIL_CHANNEL_ID     = process.env.VOICEMAIL_CHANNEL_ID || process.env.VOICEMAIL_CHANNEL_ID || "";
 const BREAKING_NEWS_CHANNEL_ID = process.env.BREAKING_NEWS_CHANNEL_ID || "1407176815285637313"; // forum channel
 
 // ---------- DISCORD ----------
