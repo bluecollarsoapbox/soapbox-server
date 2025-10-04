@@ -32,7 +32,7 @@ const TARGET_W = 1280, TARGET_H = 720; // letterbox target (16:9)
 const DISCORD_TOKEN            = process.env.DISCORD_TOKEN || "";
 const CONFESSIONS_CHANNEL_ID   = process.env.CONFESSIONS_CHANNEL_ID || "";
 const SPOTLIGHT_CHANNEL_ID     = process.env.SPOTLIGHT_CHANNEL_ID || "";
-const VOICEMAIL_CHANNEL_ID     = process.env.VOICEMAIL_CHANNEL_ID || process.env.VOICEMAIL_CHANNEL_ID || "";
+const VOICEMAIL_CHANNEL_ID     = process.env.VOICEMAIL_CHANNEL_ID || "";
 const BREAKING_NEWS_CHANNEL_ID = process.env.BREAKING_NEWS_CHANNEL_ID || "1407176815285637313"; // forum channel
 
 // ---------- DISCORD ----------
@@ -493,61 +493,87 @@ app.post("/admin/story/:id/voicemail", requireAdmin, upload.single("audio"), asy
   }
 });
 
-// ---------- THREAD UTILS (NEW) ----------
+// ---------- THREAD UTILS (robust, story-key based) ----------
 async function getOrCreateThread(channelId, storyId, headline, contentIfCreate) {
   const ch = await discordClient.channels.fetch(channelId);
   if (!ch) throw new Error("Breaking News channel not found");
 
-  let map = readThreadMap();
-  let threadId = map[storyId];
+  // Always normalize a searchable key like "story1"
+  const storyKey = String(storyId || "").toLowerCase();
 
   // 1) Try mapped thread ID first
-  if (threadId) {
+  const map = readThreadMap();
+  const mapped = map[storyId];
+  if (mapped) {
     try {
-      const existing = await discordClient.channels.fetch(threadId);
+      const existing = await discordClient.channels.fetch(mapped);
       if (existing) return existing;
-    } catch (_) { /* fall through */ }
+    } catch (_) { /* mapping stale, continue */ }
   }
 
-  // 2) Try to find an existing thread by name (active + archived)
-  if (ch.type === ChannelType.GuildForum) {
-    const nameCandidates = new Set([
-      headline.toLowerCase(),
-      storyId.toLowerCase(),
-    ]);
+  // 2) Hunt by name in active+archived threads, prefer latest with storyKey in the name
+  const findByName = async () => {
+    if (ch.type !== ChannelType.GuildForum) return null;
+
+    // helper to scan a ThreadChannelManager result set
+    const pick = (coll) => {
+      if (!coll?.threads?.size) return null;
+      // prefer names starting with "StoryX", else any that contain it
+      const candidates = coll.threads
+        .filter(t => typeof t.name === "string")
+        .map(t => t)
+        .sort((a, b) => (b.archiveTimestamp || 0) - (a.archiveTimestamp || 0));
+
+      let best = null;
+      for (const t of candidates) {
+        const name = String(t.name || "").toLowerCase();
+        if (name.startsWith(storyKey)) { best = t; break; }
+      }
+      if (!best) {
+        for (const t of candidates) {
+          const name = String(t.name || "").toLowerCase();
+          if (name.includes(storyKey)) { best = t; break; }
+        }
+      }
+      return best;
+    };
 
     try {
       const active = await ch.threads.fetchActive();
-      const foundA = active?.threads?.find(t => nameCandidates.has(String(t.name || "").toLowerCase()));
-      if (foundA) {
-        map[storyId] = foundA.id; writeThreadMap(map);
-        return foundA;
-      }
+      const hitA = pick(active);
+      if (hitA) return hitA;
     } catch (_) {}
 
     try {
       const archived = await ch.threads.fetchArchived();
-      const foundB = archived?.threads?.find(t => nameCandidates.has(String(t.name || "").toLowerCase()));
-      if (foundB) {
-        map[storyId] = foundB.id; writeThreadMap(map);
-        return foundB;
-      }
+      const hitB = pick(archived);
+      if (hitB) return hitB;
     } catch (_) {}
+
+    return null;
+  };
+
+  const found = await findByName();
+  if (found) {
+    map[storyId] = found.id; writeThreadMap(map);
+    return found;
   }
 
-  // 3) Create a new thread and save mapping
+  // 3) Create a new thread — **prefix with the story key** so we can always find it later
   if (ch.type === ChannelType.GuildForum) {
+    const safeHeadline = String(headline || storyId);
     const created = await ch.threads.create({
-      name: headline,
+      name: `${storyId} — ${safeHeadline}`,
       message: contentIfCreate ? { content: contentIfCreate } : undefined,
     });
     map[storyId] = created.id; writeThreadMap(map);
     return created;
   }
 
-  // Non-forum fallback: just use the channel
+  // Non-forum fallback
   return ch;
 }
+
 
 // ---------- DISCORD PUBLISH HELPERS ----------
 function resolveStoryAssets(storyId) {
@@ -682,7 +708,7 @@ app.post("/admin/story/:id/witness", requireAdmin, upload.single("video"), async
     if (REQUIRE_LANDSCAPE) {
       const dims = await getVideoDims(originalPath);
       if (dims && dims.width && dims.height && dims.height > dims.width) {
-        try { fs.unlinkSync(originalPath); } catch(_) {}
+        try { fs.unlinkSync(originalPath); } catch {} // cleanup on reject
         return res.status(400).json({ error: "Please upload landscape (wide) video. Portrait is not accepted." });
       }
     }
@@ -692,29 +718,27 @@ app.post("/admin/story/:id/witness", requireAdmin, upload.single("video"), async
     let toSend = await maybeWatermark(originalPath, watermarkedPath);
     if (!toSend) toSend = originalPath;
 
-    // Post into the mapped thread if present, else Voicemails channel
-    const map = readThreadMap();
-    const mappedThread = map[storyId];
-
-    if (mappedThread) {
-      const thread = await discordClient.channels.fetch(mappedThread);
-      if (thread) {
-        await thread.send({
-          content: `🎥 Witness submission — **${storyId}**`,
-          files: [new AttachmentBuilder(toSend)]
-        });
-      } else {
-        if (!VOICEMAIL_CHANNEL_ID) return res.status(500).json({ error: "VOICEMAIL_CHANNEL_ID not set" });
-        const ch = await discordClient.channels.fetch(VOICEMAIL_CHANNEL_ID);
-        if (!ch) return res.status(500).json({ error: "Discord channel not found" });
-        await ch.send({ content: `🎥 Witness submission — **${storyId}**`, files: [new AttachmentBuilder(toSend)] });
-      }
-    } else {
-      if (!VOICEMAIL_CHANNEL_ID) return res.status(500).json({ error: "VOICEMAIL_CHANNEL_ID not set" });
-      const ch = await discordClient.channels.fetch(VOICEMAIL_CHANNEL_ID);
-      if (!ch) return res.status(500).json({ error: "Discord channel not found" });
-      await ch.send({ content: `🎥 Witness submission — **${storyId}**`, files: [new AttachmentBuilder(toSend)] });
+    // Always post into the story’s thread in BREAKING_NEWS forum
+    if (!BREAKING_NEWS_CHANNEL_ID) {
+      return res.status(500).json({ error: "BREAKING_NEWS_CHANNEL_ID not set" });
     }
+
+    const meta     = readStoryMeta(storyId);
+    const headline = (meta.title || storyId).toString();
+    const subline  = (meta.subtitle || "").toString();
+
+    // This helper will: use saved map -> search active/archived by name -> create if missing
+    const thread = await getOrCreateThread(
+      BREAKING_NEWS_CHANNEL_ID,
+      storyId,
+      headline,
+      subline ? `**${headline}**\n${subline}` : `**${headline}**`
+    );
+
+    await thread.send({
+      content: `🎥 Witness submission — **${storyId}**`,
+      files: [new AttachmentBuilder(toSend)]
+    });
 
     res.json({
       ok: true,
@@ -726,6 +750,7 @@ app.post("/admin/story/:id/witness", requireAdmin, upload.single("video"), async
     res.status(500).json({ error: err.message });
   }
 });
+
 
 // ---------- DEBUG ----------
 app.get("/admin/debug/story/:id", requireAdmin, (req, res) => {
