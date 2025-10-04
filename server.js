@@ -403,11 +403,21 @@ async function maybeWatermark(inputPath, outputPath) {
 
   ffmpeg.setFfmpegPath(ffmpegPath);
 
-  // Optional watermark image
-  const wm1 = path.join(DATA_ROOT, "app", "watermark.png");
-  const wm2 = path.join(DATA_ROOT, "app", "wm.png");
-  const wm = fs.existsSync(wm1) ? wm1 : (fs.existsSync(wm2) ? wm2 : null);
+ // Optional watermark image (check several common spots)
+const candidateWMs = [
+  path.join(DATA_ROOT, "app", "watermark.png"),
+  path.join(DATA_ROOT, "app", "wm.png"),
+  // your repo/local paths:
+  path.join(__dirname, "assets", "logo.png"),
+  path.join(process.cwd(), "assets", "logo.png"),
+  path.join(__dirname, "assets", "watermark.png"),
+  path.join(process.cwd(), "assets", "watermark.png"),
+];
 
+let wm = null;
+for (const p of candidateWMs) {
+  if (fs.existsSync(p)) { wm = p; break; }
+}
   ensureDir(path.dirname(outputPath));
 
   // scale to fit, pad to 1280x720, keep SAR=1, then overlay watermark if present
