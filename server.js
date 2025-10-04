@@ -23,6 +23,11 @@ try { makeVoicemailVideo = require("./makeVoicemailVideo"); } catch (_) {}
 const DATA_ROOT = process.env.DATA_DIR || process.env.DATA_ROOT || "/opt/render/project/data";
 const ADMIN_KEY = process.env.SOAPBOX_API_KEY || "changeme";
 
+// --- VIDEO RULES ---
+const REQUIRE_LANDSCAPE = false; // set true to HARD-REJECT portrait uploads
+const TARGET_W = 1280, TARGET_H = 720; // letterbox target (16:9)
+
+
 // Discord envs (BREAKING_NEWS has a safe fallback to your known ID)
 const DISCORD_TOKEN            = process.env.DISCORD_TOKEN || "";
 const CONFESSIONS_CHANNEL_ID   = process.env.CONFESSIONS_CHANNEL_ID || "";
@@ -393,6 +398,67 @@ app.post("/admin/story/:id/voicemail", requireAdmin, upload.single("audio"), asy
       mp4Path = null;
     }
 
+    // Try to watermark AND normalize aspect to 16:9. Returns outputPath or null on failure.
+async function maybeWatermark(inputPath, outputPath) {
+  let ffmpeg, ffmpegPath;
+  try { ffmpeg = require("fluent-ffmpeg"); } catch (_) { return null; }
+
+  // Resolve ffmpeg binary
+  try {
+    const staticPath = require("ffmpeg-static");
+    if (staticPath && fs.existsSync(staticPath)) ffmpegPath = staticPath;
+  } catch(_) {}
+  if (!ffmpegPath) {
+    try {
+      const inst = require("@ffmpeg-installer/ffmpeg");
+      if (inst && inst.path && fs.existsSync(inst.path)) ffmpegPath = inst.path;
+    } catch(_) {}
+  }
+  if (!ffmpegPath) return null;
+
+  ffmpeg.setFfmpegPath(ffmpegPath);
+
+  // Optional watermark image
+  const wm1 = path.join(DATA_ROOT, "app", "watermark.png");
+  const wm2 = path.join(DATA_ROOT, "app", "wm.png");
+  const wm = fs.existsSync(wm1) ? wm1 : (fs.existsSync(wm2) ? wm2 : null);
+
+  fs.mkdirSync(path.dirname(outputPath), { recursive: true });
+
+  // Build filter graph: scale to fit, pad to 1280x720, keep SAR=1, then overlay watermark if present
+  const baseScalePad = `scale=${TARGET_W}:${TARGET_H}:force_original_aspect_ratio=decrease,` +
+                       `pad=${TARGET_W}:${TARGET_H}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1`;
+
+  return new Promise((resolve, reject) => {
+    const cmd = ffmpeg(inputPath)
+      .outputOptions([
+        "-movflags +faststart",
+        "-c:v libx264",
+        "-preset veryfast",
+        "-crf 23",
+        "-c:a aac",
+        "-b:a 160k"
+      ]);
+
+    if (wm) {
+      cmd.input(wm)
+         .complexFilter([
+           `[0:v]${baseScalePad}[v0]`,
+           `[v0][1:v]overlay=10:10[vout]`
+         ])
+         .outputOptions(["-map", "[vout]", "-map", "0:a?"]);
+    } else {
+      cmd.videoFilters(baseScalePad);
+    }
+
+    cmd
+      .on("error", (e) => { try { fs.unlinkSync(outputPath); } catch(_) {} reject(e); })
+      .on("end", () => resolve(outputPath))
+      .save(outputPath);
+  }).catch(() => null);
+}
+
+
     res.json({ ok: true, mp3: urlFor(mp3Path), mp4: mp4Path ? urlFor(mp4Path) : null });
   } catch (err) {
     console.error(err);
@@ -569,6 +635,24 @@ app.post("/admin/publish-stories", requireAdmin, async (req, res) => {
   }
 });
 
+async function getVideoDims(filePath) {
+  try {
+    const ffmpeg = require("fluent-ffmpeg");
+    return new Promise((resolve, reject) => {
+      ffmpeg.ffprobe(filePath, (err, data) => {
+        if (err) return resolve(null);
+        const vs = (data.streams || []).find(s => s.codec_type === "video");
+        if (!vs) return resolve(null);
+        const w = Number(vs.width || 0), h = Number(vs.height || 0);
+        resolve({ width: w, height: h });
+      });
+    });
+  } catch (_) {
+    return null;
+  }
+}
+
+
 // ---------- ADMIN: WITNESS (posts into story's thread) ----------
 app.post("/admin/story/:id/witness", requireAdmin, upload.single("video"), async (req, res) => {
   try {
@@ -587,6 +671,22 @@ app.post("/admin/story/:id/witness", requireAdmin, upload.single("video"), async
     const meta = readStoryMeta(storyId);
     const headline = (meta.title || storyId).toString();
     const subline = (meta.subtitle || "").toString();
+
+    // After: fs.renameSync(req.file.path, originalPath);
+
+// Optional: enforce landscape uploads
+const dims = await getVideoDims(originalPath);
+if (REQUIRE_LANDSCAPE && dims && dims.width && dims.height && dims.height > dims.width) {
+  // cleanup and reject
+  try { fs.unlinkSync(originalPath); } catch(_) {}
+  return res.status(400).json({ error: "Please upload landscape (wide) video. Portrait is not accepted." });
+}
+
+// Always normalize to 16:9 with letterbox (and watermark if present)
+const watermarkedPath = path.join(postedDir, `${ts}.mp4`);
+let toSend = await maybeWatermark(originalPath, watermarkedPath);
+if (!toSend) toSend = originalPath; // fallback if ffmpeg missing
+
 
     // ✅ Reuse existing thread or find by name before creating
     const thread = await getOrCreateThread(
