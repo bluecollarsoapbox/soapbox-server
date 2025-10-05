@@ -917,6 +917,32 @@ app.get("/admin/witness-index", requireAdmin, (_req, res) => {
 // ---------- 404 ----------
 app.use((_req, res) => res.status(404).json({ error: "Not found" }));
 
+const fsp = require('fs').promises;
+
+(async () => {
+  const REPO_STORIES = path.join(__dirname, "Stories");
+  const DATA_STORIES = path.join(DATA_ROOT, "Stories");
+  ensureDir(DATA_STORIES);
+
+  async function copyTree(src, dst) {
+    try { await fsp.mkdir(dst, { recursive: true }); } catch {}
+    for (const name of await fsp.readdir(src)) {
+      const s = path.join(src, name);
+      const d = path.join(dst, name);
+      const st = await fsp.stat(s);
+      if (st.isDirectory()) await copyTree(s, d);
+      else await fsp.copyFile(s, d);
+    }
+  }
+
+  if (fs.existsSync(REPO_STORIES)) {
+    await copyTree(REPO_STORIES, DATA_STORIES);
+    console.log("[Boot] Stories synced to DATA_ROOT");
+  }
+})();
+
+publishActiveStories("").catch(()=>{});
+
 // ---------- START ----------
 const PORT = process.env.PORT || 3030;
 app.listen(PORT, () => {
