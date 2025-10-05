@@ -494,83 +494,81 @@ app.post("/admin/story/:id/voicemail", requireAdmin, upload.single("audio"), asy
   }
 });
 
-// ---------- THREAD UTILS (robust, story-key based) ----------
+// ---------- THREAD UTILS (robust, normalization-based) ----------
 async function getOrCreateThread(channelId, storyId, headline, contentIfCreate) {
   const ch = await discordClient.channels.fetch(channelId);
   if (!ch) throw new Error("Breaking News channel not found");
 
-  // Normalize: "story1"
-  const storyKey = String(storyId || "").toLowerCase();
-  // Canonical prefix: "story1 —"
-  const canonPrefix = `${storyKey} —`;
+  // Normalize to a key like "story1"
+  const rawId   = String(storyId || "");
+  const num     = (rawId.match(/\d+/) || [""])[0];
+  const key     = num ? `story${num}` : rawId;
+  const norm    = (s) => String(s || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+  const normKey = norm(key); // e.g. "story1"
 
-  // 1) Try mapped thread ID first
+  // Also accept names that *start with* "story1" (with spaces/dashes/emojis etc.)
+  const startsWithKey = (name) => norm(name).startsWith(normKey);
+  const containsKey   = (name) => norm(name).includes(normKey);
+
+  // 1) Try cached mapping
   const map = readThreadMap();
-  const mapped = map[storyId];
+  const mapped = map[rawId];
   if (mapped) {
     try {
       const existing = await discordClient.channels.fetch(mapped);
       if (existing) return existing;
-    } catch (_) { /* mapping stale */ }
+    } catch {} // stale, continue
   }
 
-  // 2) Search active & archived by name
-  const findByName = async () => {
-    if (ch.type !== ChannelType.GuildForum) return null;
+  // Helper to scan a collection result (active/archived)
+  const findIn = (coll) => {
+    const threads = coll?.threads;
+    if (!threads?.size) return null;
 
-    const pick = (coll) => {
-      const threads = coll?.threads;
-      if (!threads?.size) return null;
+    // newest first
+    const arr = [...threads.values()].sort((a, b) => {
+      const at = Number(b.archiveTimestamp || b.createdTimestamp || 0);
+      const bt = Number(a.archiveTimestamp || a.createdTimestamp || 0);
+      return at - bt;
+    });
 
-      // newest first
-      const arr = [...threads.values()].sort((a, b) => {
-        const at = Number(b.archiveTimestamp || b.createdTimestamp || 0);
-        const bt = Number(a.archiveTimestamp || a.createdTimestamp || 0);
-        return at - bt;
-      });
-
-      // prefer names that START with "storyX —"
-      let best = arr.find(t => String(t.name || "").toLowerCase().startsWith(canonPrefix));
-      if (!best) best = arr.find(t => String(t.name || "").toLowerCase().startsWith(storyKey));
-      if (!best) best = arr.find(t => String(t.name || "").toLowerCase().includes(storyKey));
-      return best || null;
-    };
-
-    try {
-      const active = await ch.threads.fetchActive();
-      const hitA = pick(active);
-      if (hitA) return hitA;
-    } catch {}
-
-    try {
-      const archived = await ch.threads.fetchArchived({ limit: 100 });
-      const hitB = pick(archived);
-      if (hitB) return hitB;
-    } catch {}
-
-    return null;
+    // prefer names that START with key; else any that CONTAIN it
+    let hit = arr.find(t => startsWithKey(t.name));
+    if (!hit) hit = arr.find(t => containsKey(t.name));
+    return hit || null;
   };
 
-  const found = await findByName();
-  if (found) {
-    map[storyId] = found.id; writeThreadMap(map);
-    return found;
+  // 2) Search forum (active + archived)
+  if (ch.type === ChannelType.GuildForum) {
+    try {
+      const active = await ch.threads.fetchActive();
+      const a = findIn(active);
+      if (a) { map[rawId] = a.id; writeThreadMap(map); return a; }
+    } catch {}
+
+    try {
+      // grab as many as API allows; default limit is 25
+      const archived = await ch.threads.fetchArchived({ limit: 100 });
+      const b = findIn(archived);
+      if (b) { map[rawId] = b.id; writeThreadMap(map); return b; }
+    } catch {}
   }
 
-  // 3) Create a new thread with a canonical name so we can always find it later
+  // 3) Create once — with a canonical, searchable prefix "Story{N} — ..."
   if (ch.type === ChannelType.GuildForum) {
-    const safeHeadline = String(headline || storyId);
+    const safeHeadline = String(headline || rawId);
+    const canonical = num ? `Story${num} — ${safeHeadline}` : `${rawId} — ${safeHeadline}`;
     const created = await ch.threads.create({
-      name: `${storyId} — ${safeHeadline}`.slice(0, 96),
+      name: canonical.slice(0, 96),
       message: contentIfCreate ? { content: contentIfCreate } : undefined,
     });
-    map[storyId] = created.id; writeThreadMap(map);
+    map[rawId] = created.id; writeThreadMap(map);
     return created;
   }
 
-  // Non-forum fallback (shouldn't happen for your channel)
-  return ch;
+  return ch; // non-forum fallback (shouldn’t be used)
 }
+
 
 
 
