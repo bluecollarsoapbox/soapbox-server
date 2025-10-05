@@ -403,21 +403,19 @@ async function maybeWatermark(inputPath, outputPath) {
 
   ffmpeg.setFfmpegPath(ffmpegPath);
 
- // Optional watermark image (check several common spots)
-const candidateWMs = [
-  path.join(DATA_ROOT, "app", "watermark.png"),
-  path.join(DATA_ROOT, "app", "wm.png"),
-  // your repo/local paths:
-  path.join(__dirname, "assets", "logo.png"),
-  path.join(process.cwd(), "assets", "logo.png"),
-  path.join(__dirname, "assets", "watermark.png"),
-  path.join(process.cwd(), "assets", "watermark.png"),
-];
+  // Optional watermark image (check several common spots)
+  const candidateWMs = [
+    path.join(DATA_ROOT, "app", "watermark.png"),
+    path.join(DATA_ROOT, "app", "wm.png"),
+    path.join(__dirname, "assets", "logo.png"),
+    path.join(process.cwd(), "assets", "logo.png"),
+    path.join(__dirname, "assets", "watermark.png"),
+    path.join(process.cwd(), "assets", "watermark.png"),
+  ];
 
-let wm = null;
-for (const p of candidateWMs) {
-  if (fs.existsSync(p)) { wm = p; break; }
-}
+  let wm = null;
+  for (const p of candidateWMs) { if (fs.existsSync(p)) { wm = p; break; } }
+
   ensureDir(path.dirname(outputPath));
 
   // scale to fit, pad to 1280x720, keep SAR=1, then overlay watermark if present
@@ -432,6 +430,7 @@ for (const p of candidateWMs) {
         "-c:v libx264",
         "-preset veryfast",
         "-crf 23",
+        "-pix_fmt yuv420p",        // ✅ broad compatibility (Windows players, Discord)
         "-c:a aac",
         "-b:a 160k"
       ]);
@@ -447,11 +446,13 @@ for (const p of candidateWMs) {
       cmd.videoFilters(baseScalePad);
     }
 
-    cmd.on("error", (e) => { try { fs.unlinkSync(outputPath); } catch(_) {} reject(e); })
-       .on("end", () => resolve(outputPath))
-       .save(outputPath);
+    cmd
+      .on("error", (e) => { try { fs.unlinkSync(outputPath); } catch(_) {} reject(e); })
+      .on("end", () => resolve(outputPath))
+      .save(outputPath);
   }).catch(() => null);
 }
+
 
 // ---------- ADMIN: VOICEMAIL UPLOAD (per story) ----------
 app.post("/admin/story/:id/voicemail", requireAdmin, upload.single("audio"), async (req, res) => {
@@ -498,8 +499,10 @@ async function getOrCreateThread(channelId, storyId, headline, contentIfCreate) 
   const ch = await discordClient.channels.fetch(channelId);
   if (!ch) throw new Error("Breaking News channel not found");
 
-  // Always normalize a searchable key like "story1"
+  // Normalize: "story1"
   const storyKey = String(storyId || "").toLowerCase();
+  // Canonical prefix: "story1 —"
+  const canonPrefix = `${storyKey} —`;
 
   // 1) Try mapped thread ID first
   const map = readThreadMap();
@@ -508,47 +511,42 @@ async function getOrCreateThread(channelId, storyId, headline, contentIfCreate) 
     try {
       const existing = await discordClient.channels.fetch(mapped);
       if (existing) return existing;
-    } catch (_) { /* mapping stale, continue */ }
+    } catch (_) { /* mapping stale */ }
   }
 
-  // 2) Hunt by name in active+archived threads, prefer latest with storyKey in the name
+  // 2) Search active & archived by name
   const findByName = async () => {
     if (ch.type !== ChannelType.GuildForum) return null;
 
-    // helper to scan a ThreadChannelManager result set
     const pick = (coll) => {
-      if (!coll?.threads?.size) return null;
-      // prefer names starting with "StoryX", else any that contain it
-      const candidates = coll.threads
-        .filter(t => typeof t.name === "string")
-        .map(t => t)
-        .sort((a, b) => (b.archiveTimestamp || 0) - (a.archiveTimestamp || 0));
+      const threads = coll?.threads;
+      if (!threads?.size) return null;
 
-      let best = null;
-      for (const t of candidates) {
-        const name = String(t.name || "").toLowerCase();
-        if (name.startsWith(storyKey)) { best = t; break; }
-      }
-      if (!best) {
-        for (const t of candidates) {
-          const name = String(t.name || "").toLowerCase();
-          if (name.includes(storyKey)) { best = t; break; }
-        }
-      }
-      return best;
+      // newest first
+      const arr = [...threads.values()].sort((a, b) => {
+        const at = Number(b.archiveTimestamp || b.createdTimestamp || 0);
+        const bt = Number(a.archiveTimestamp || a.createdTimestamp || 0);
+        return at - bt;
+      });
+
+      // prefer names that START with "storyX —"
+      let best = arr.find(t => String(t.name || "").toLowerCase().startsWith(canonPrefix));
+      if (!best) best = arr.find(t => String(t.name || "").toLowerCase().startsWith(storyKey));
+      if (!best) best = arr.find(t => String(t.name || "").toLowerCase().includes(storyKey));
+      return best || null;
     };
 
     try {
       const active = await ch.threads.fetchActive();
       const hitA = pick(active);
       if (hitA) return hitA;
-    } catch (_) {}
+    } catch {}
 
     try {
-      const archived = await ch.threads.fetchArchived();
+      const archived = await ch.threads.fetchArchived({ limit: 100 });
       const hitB = pick(archived);
       if (hitB) return hitB;
-    } catch (_) {}
+    } catch {}
 
     return null;
   };
@@ -559,20 +557,21 @@ async function getOrCreateThread(channelId, storyId, headline, contentIfCreate) 
     return found;
   }
 
-  // 3) Create a new thread — **prefix with the story key** so we can always find it later
+  // 3) Create a new thread with a canonical name so we can always find it later
   if (ch.type === ChannelType.GuildForum) {
     const safeHeadline = String(headline || storyId);
     const created = await ch.threads.create({
-      name: `${storyId} — ${safeHeadline}`,
+      name: `${storyId} — ${safeHeadline}`.slice(0, 96),
       message: contentIfCreate ? { content: contentIfCreate } : undefined,
     });
     map[storyId] = created.id; writeThreadMap(map);
     return created;
   }
 
-  // Non-forum fallback
+  // Non-forum fallback (shouldn't happen for your channel)
   return ch;
 }
+
 
 
 // ---------- DISCORD PUBLISH HELPERS ----------
